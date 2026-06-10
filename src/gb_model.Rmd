@@ -1,0 +1,349 @@
+---
+title: "cosmx_pipeline_for_franz"
+author: "Giuseppe Barisano"
+date: "2026-06-02"
+output: html_document
+---
+```{r}
+# clear workspace variables
+rm(list = ls())
+# it means ctrl+L. clear window
+cat("\014")
+# close all plots
+graphics.off()
+library(ggplot2)
+library(dplyr)
+library(Seurat)
+library(scPearsonPCA);library(ggrepel) #ggrepel is required for scPearsonPCA plotting
+library(data.table)
+#library(InSituType)
+
+myflatfiledir="usc1+usc2+usc5/flatFiles"
+outdir="youroutdir"
+```
+#data prep
+```{r}
+usc=gbspatial::dataprep_cosmx(myflatfiledir,plot_tissues = T)
+```
+### QC
+```{r}
+#QC
+uscqc=gbspatial::run_spatial_qc(counts=usc$counts,metadata=usc$metadata,negcounts = usc$negcounts,xy=xy) #takes 30-40 minutes for the entire QC. The longest step is runfovqc
+#The following FOVs failed QC: s1f120, s1f121, s1f122, s1f123, s1f177, s1f70, s4f128, s4f150, s4f183, s4f266, s4f276, s4f284, s4f287, s4f32, s4f362, s4f414, s4f431, s4f459, s1f230
+#77,076 flagged cells
+uscqc$plots$nCount_hist
+uscqc$plots$area_hist
+uscqc$plots$fov_boundary
+uscqc$plots$regional_sbr
+uscqc$plots$upset_plot
+```
+### Remove flagged cells and FOVs
+```{r remove}
+if(!dir.exists(paste0(outdir, "/processed_data"))){
+  dir.create(paste0(outdir, "/processed_data"))
+}
+
+saveRDS(usc$counts, paste0(outdir, "/processed_data/counts_unfiltered.RDS"))
+saveRDS(usc$negcounts, paste0(outdir, "/processed_data/negcounts_unfiltered.RDS"))
+saveRDS(usc$falsecounts, paste0(outdir, "/processed_data/falsecounts_unfiltered.RDS"))
+saveRDS(usc$metadata, paste0(outdir, "/processed_data/metadata_unfiltered.RDS"))
+saveRDS(usc$xy, paste0(outdir, "/processed_data/xy_unfiltered.RDS"))
+saveRDS(usc$polygons, paste0(outdir, "/processed_data/polygons_unfiltered.RDS"))
+
+
+saveRDS(uscqc, paste0(outdir, "/processed_data/qc.RDS")) #takes 10-15 minutes to save
+saveRDS(uscqc$counts, paste0(outdir, "/processed_data/counts.RDS"))
+saveRDS(uscqc$negcounts, paste0(outdir, "/processed_data/negcounts.RDS"))
+saveRDS(usc$falsecounts[uscqc$metadata$cell_id,], paste0(outdir, "/processed_data/falsecounts.RDS"))
+saveRDS(uscqc$metadata, paste0(outdir, "/processed_data/metadata.RDS"))
+saveRDS(uscqc$xy, paste0(outdir, "/processed_data/xy.RDS"))
+saveRDS(usc$polygons[usc$polygons$cell_ID %in% uscqc$metadata$cell_id,], paste0(outdir, "/processed_data/polygons.RDS"))
+```
+#assign FOV to core with patient IDs
+```{r}
+#USC1: 11r x 9c
+#USC2: 9r x 7c
+#USC4: 9r x 7c
+#USC5: 9r x 7c
+tmafiles=paste0("usc/",tolower(unique(usc$metadata$Run_Tissue_name)),".xlsx")
+tmamaplists=list(
+usc1=sub(",.*","",apply(as.matrix(openxlsx::read.xlsx(tmafiles[1], colNames = FALSE)), 2, rev)),
+usc2=sub(",.*", "",as.matrix(openxlsx::read.xlsx(tmafiles[2], colNames = FALSE))[-10,]), #remove the last row, because it is not visible in the CosMx data
+usc5=sub(",.*", "",as.matrix(openxlsx::read.xlsx(tmafiles[3], colNames = FALSE))[,7:1]),
+usc4=sub(",.*","",as.matrix(openxlsx::read.xlsx(tmafiles[4], colNames = FALSE))[9:1,7:1])
+)
+
+
+tmamapping <- gbspatial::assign_fovs_to_cores(#USC5_247 has issues
+  fov_input = list.files(myflatfiledir, pattern = "_fov_positions_file\\.csv\\.gz$", recursive = TRUE, full.names = TRUE),
+  slidelabels = unique(usc$metadata$Run_Tissue_name),
+  cell_input = split(usc$metadata, factor(usc$metadata$Run_Tissue_name,levels=c("USC1","USC2","USC5","USC4"))),
+  tma_map_input = tmamaplists
+  )
+
+#print all plots at once:
+#invisible(lapply(tmamapping$plots, print))
+
+tmamapping$plots$USC1$Whole_Slide_by_Column
+tmamapping$plots$USC1$Whole_Slide_by_Row
+tmamapping$plots$USC2$Whole_Slide_by_Column
+tmamapping$plots$USC2$Whole_Slide_by_Row
+tmamapping$plots$USC4$Whole_Slide_by_Column
+tmamapping$plots$USC4$Whole_Slide_by_Row
+tmamapping$plots$USC5$Whole_Slide_by_Column
+tmamapping$plots$USC5$Whole_Slide_by_Row
+
+#MANUAL CORRECTION 
+tmamapping$mapped_data[tmamapping$mapped_data$FOV=="USC5_252",c("core_col","core_row","core_str","id")]=tmamapping$mapped_data[tmamapping$mapped_data$FOV=="USC5_253",c("core_col","core_row","core_str","id")]
+
+# merge your mapped data to the metadata
+uscqc$metadata=merge(tmamapping$mapped_data %>% rename(fov=original_FOV) %>% dplyr::select(c("fov","core_str","id","slidename")),uscqc$metadata,by=c("fov","slidename"))
+```
+
+#UMAP + Clustering + InSituType
+```{r}
+#counts=readRDS(paste0(outdir,"/processed_data/counts_unfiltered.RDS"))
+#metadata=readRDS(paste0(outdir,"/processed_data/metadata_unfiltered.RDS"))
+
+#counts=readRDS(paste0(outdir,"/processed_data/counts.RDS"))
+#metadata=readRDS(paste0(outdir,"/processed_data/metadata.RDS"))
+
+Sys.time()
+if (all(colnames(t(uscqc$counts))==uscqc$metadata$cell_id[match(colnames(t(uscqc$counts)),uscqc$metadata$cell_ID)])){
+  sem=Seurat::CreateSeuratObject(t(uscqc$counts),assay = "RNA",meta.data = uscqc$metadata[match(colnames(t(uscqc$counts)),uscqc$metadata$cell_ID),])
+} else {stop("Cannot create seurat object because metadata and counts do not match")}
+colnames(sem[["RNA"]]@layers$counts) <- colnames(sem)
+rownames(sem[["RNA"]]@layers$counts) <- rownames(sem[["RNA"]])
+
+
+tc <- Matrix::colSums(sem[["RNA"]]@layers$counts) ## total counts per cell (across all genes)
+sem <- Seurat::FindVariableFeatures(sem,nfeatures = 2000) #default nfeatures to use is 2000 genes.
+hvgs <- Seurat::VariableFeatures(sem[["RNA"]])
+
+
+
+message("Running scPearsonPCA on a single TMA")
+genefreq <- scPearsonPCA::gene_frequency(sem[["RNA"]]@layers$counts) ## gene frequency (across all cells)
+sum(genefreq)==1 # TRUE
+
+### Returns a Seurat-style DimReduc object with 
+### hvgs x pcs feature loadings
+### cells x pcs cell embeddings
+### gene-length vector of the mean pearson of residuals
+### gene-length vector of the standard deviation of pearson residuals
+pcaobj <- 
+scPearsonPCA::sparse_quasipoisson_pca_seurat(sem[["RNA"]]@layers$counts[hvgs,]
+                               ,totalcounts = tc
+                               ,grate = genefreq[hvgs]
+                               ,scale.max = 10 ## PCs reflect clipping pearson residuals > 10 SDs above the mean pearson residual
+                               ,do.scale = TRUE ## PCs reflect as if pearson residuals for each gene were scaled to have standard deviation=1
+                               ,do.center = TRUE ## PCs reflect as if pearson residuals for each gene were centered to have mean=0
+                               )
+umapobj <- scPearsonPCA::make_umap(pcaobj)
+sem[["pearsonpca"]] <- pcaobj$reduction.data
+sem[["pearsonumap"]] <- umapobj$ump  ## umap
+sem[["pearsongraph"]] <- Seurat::as.Graph(umapobj$grph) ## nearest neighbors / adjacency matrix used for unsupervised clustering
+sem <- Seurat::FindClusters(sem, graph = "pearsongraph", algorithm=4,cluster.name = "pearson_clusters") #algorihtm=4 is the Leiden algorithm, which seems to be more commonly used in spatial transcriptomics. Requires to be installed with install.packages('leidenbase')
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap", clustercol = "pearson_clusters", semuse = sem)
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap", clustercol = "Run_Tissue_name", semuse = sem,alpha=0.1)
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap", clustercol = "id", semuse = sem,alpha=0.1)
+
+#PCA with batch effect correction for TMA ID if there are more TMAs
+if (length(unique(sem$Run_Tissue_name))>1){ #if there are multiple TMAs, perform PR normalization controlling for TMA batch effect
+message("Running scPearsonPCA on multiple TMAs controlling for batch effect")
+    genefreq_batch <- 
+scPearsonPCA::gene_frequency(sem[["RNA"]]@layers$counts, obs = data.table(sem@meta.data)[,.(cell_ID, Run_Tissue_name)] #after you run PearsonPCA the metadata in the seurat object gets modified: cell_id becomes cell_ID
+               ,cellid_colname = "cell_ID"
+               ,batch_variable = "Run_Tissue_name")
+Matrix::colSums(genefreq_batch)
+
+### Returns a Seurat-style DimReduc object with 
+### hvgs x pcs feature loadings
+### cells x pcs cell embeddings
+### gene-length vector of the mean pearson of residuals
+### gene-length vector of the standard deviation of pearson residuals
+pcaobj_batch <- 
+scPearsonPCA::sparse_quasipoisson_pca_seurat_batch(sem[["RNA"]]@layers$counts[hvgs,]
+                                     ,totalcounts = tc
+                                     ,grate = genefreq_batch[hvgs,] ##
+                                     ,obs =data.table(sem@meta.data)[,.(cell_ID, Run_Tissue_name)] 
+                                     ,batch_variable = "Run_Tissue_name"
+                                     ,cellid_colname = "cell_ID"
+                                     ,scale.max = 10
+                                     ,do.scale = TRUE
+                                     ,do.center = TRUE
+                                     )
+
+umapobj_batch <- scPearsonPCA::make_umap(pcaobj_batch)
+sem[["pearsonpca_tma"]] <- pcaobj_batch$reduction.data
+sem[["pearsonumap_tma"]] <- umapobj_batch$ump  ## umap
+sem[["pearsongraph_tma"]] <- Seurat::as.Graph(umapobj_batch$grph) ## nearest neighbors / adjacency matrix used for unsupervised clustering
+sem <- Seurat::FindClusters(sem, graph = "pearsongraph_tma", algorithm=4,cluster.name = "pearson_clusters_tma") #algorihtm=4 is the Leiden algorithm, which seems to be more commonly used in spatial transcriptomics. Requires to be installed with install.packages('leidenbase')
+
+###UMAP plot with batch effect correction for TMA
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap_tma", clustercol = "pearson_clusters_tma", semuse = sem,alpha=0.1)
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap_tma", clustercol = "Run_Tissue_name", semuse = sem,alpha=0.1)
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap_tma", clustercol = "id", semuse = sem,alpha=0.1) + geom_text_repel(aes(label = ""))
+}
+#PCA with batch effect correction for subject ID if present
+if (length(unique(sem$id))>1){
+  message("Running scPearsonPCA controlling for subject ID as batch effect")
+  semsub=subset(sem,!is.na(id) & id!="PLACENTA")
+  colnames(semsub[["RNA"]]@layers$counts) <- colnames(semsub)
+rownames(semsub[["RNA"]]@layers$counts) <- rownames(semsub[["RNA"]])
+tcsub <- Matrix::colSums(semsub[["RNA"]]@layers$counts) ## total counts per cell (across all genes)
+      
+genefreq_id <- 
+scPearsonPCA::gene_frequency(semsub[["RNA"]]@layers$counts, obs = data.table(semsub@meta.data)[,.(cell_ID, Run_Tissue_name, id)]
+               ,cellid_colname = "cell_ID"
+               ,batch_variable = "id")
+Matrix::colSums(genefreq_id)
+pcaobj_id <- 
+scPearsonPCA::sparse_quasipoisson_pca_seurat_batch(semsub[["RNA"]]@layers$counts[hvgs,]
+                                     ,totalcounts = tcsub
+                                     ,grate = genefreq_id[hvgs,] ##
+                                     ,obs =data.table(semsub@meta.data)[,.(cell_ID, Run_Tissue_name, id)] 
+                                     ,batch_variable = "id"
+                                     ,cellid_colname = "cell_ID"
+                                     ,scale.max = 10
+                                     ,do.scale = TRUE
+                                     ,do.center = TRUE
+                                     )
+umapobj_id <- scPearsonPCA::make_umap(pcaobj_id)
+semsub[["pearsonpca_id"]] <- pcaobj_id$reduction.data
+semsub[["pearsonumap_id"]] <- umapobj_id$ump  ## umap
+semsub[["pearsongraph_id"]] <- Seurat::as.Graph(umapobj_id$grph) ## nearest neighbors / adjacency matrix used for unsupervised clustering
+semsub <- Seurat::FindClusters(semsub, graph = "pearsongraph_id", algorithm=4,cluster.name = "pearson_clusters_id") #algorihtm=4 is the Leiden algorithm, which seems to be more commonly used in spatial transcriptomics. Requires to be installed with install.packages('leidenbase')
+
+###UMAP with batch effect correction for patient ID
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap_id", clustercol = "pearson_clusters_id", semuse = semsub,alpha=0.1)
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap_id", clustercol = "Run_Tissue_name", semuse = semsub,alpha=0.1)
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap_id", clustercol = "id", semuse = semsub,alpha=0.1)
+}
+
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap_tma", clustercol = "Run_Tissue_name", semuse = semsub,alpha=0.1)
+
+Sys.time()
+saveRDS(sem,paste0(outdir, "/processed_data/seurat_object.RDS"))
+saveRDS(semsub,paste0(outdir, "/processed_data/seurat_object_patients.RDS"))
+Sys.time()
+```
+```{r}
+p1=scPearsonPCA::plot_umap(umapreduc = "pearsonumap_tma", clustercol = "id", semuse = sem,alpha=0.1)
+p1$layers <- p1$layers[!sapply(p1$layers, function(x)
+  inherits(x$geom, "GeomTextRepel") ||
+    inherits(x$geom, "GeomLabelRepel"))]
+p1
+p2=scPearsonPCA::plot_umap(umapreduc = "pearsonumap_id", clustercol = "id", semuse = semsub,alpha=0.1)
+p2$layers <- p2$layers[!sapply(p2$layers, function(x)
+  inherits(x$geom, "GeomTextRepel") ||
+    inherits(x$geom, "GeomLabelRepel"))]
+p2
+
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap_id", clustercol = "pearson_clusters_id", semuse = semsub,alpha=0.1)
+```
+#cluster markers
+```{r}
+library(HieraType)
+
+tcsub <- Matrix::colSums(semsub[["RNA"]]@layers$counts) ## total counts per cell (across all genes)
+fctbl_rna <- clusterwise_foldchange_metrics(semsub[["RNA"]]@layers$counts
+                                            ,totalcounts = tcsub
+                                            ,metadata = semsub@meta.data
+                                            ,cluster_column = "pearson_clusters_id" #unsupervised
+                                            )
+
+hm_rna <- add_ncells(marker_heatmap(fctbl_rna)) + labs(title = "rna heatmap")
+print(hm_rna)
+```
+#cell typing
+```{r}
+top10_nontumor=hm_rna@data[gsub(" ","",substr(hm_rna@data$cluster,1,2)) %in% c(2,4,5,7,9,10,11,15,16)] %>% group_by(cluster) %>% slice_max(order_by = scaled_fold_change, n = 10)
+#Cluster 9	T Cells	CD3D, CD3E, CD2 are definitive T cell lineage markers. CCL5 suggests they are activated effector or memory T cells.
+#Cluster 10	Plasma Cells	IGHA1, IGHG1, IGKC, and JCHAIN are textbook markers for antibody-producing plasma cells (mature B cells).
+#Cluster 5	Macrophages	C1QA, C1QB, C1QC, combined with CD14 and LYZ (Lysozyme), strongly identify this as a macrophage population.
+#Cluster 16	Monocytes / Inflammatory Myeloid	CD14 alongside S100A8, TLR2, and CLEC4A indicates a monocyte or inflammatory myeloid-derived suppressor cell (MDSC) population.
+#Cluster 7	Endothelial Cells	PECAM1 (CD31), VWF, and FLT1 (VEGFR1) are classic markers for the endothelial cells that make up blood vessels.
+#Cluster 4	Smooth Muscle (Myometrium / Myofibroblasts)	ACTA2 (Smooth Muscle Actin), MYH11, and TAGLN are definitive markers for smooth muscle. In the uterus, this is likely the native myometrium, or potentially strongly activated myofibroblasts.
+#Cluster 2	Fibroblasts / CAFs	COL1A1, COL1A2, COL6A3 (Collagen), LUM (Lumican), and PDGFRA are the standard signatures for fibroblasts or Cancer-Associated Fibroblasts (CAFs).
+#Cluster 11	Activated / Stressed Stroma	FOS, JUNB, ATF3, and DUSP1 are "immediate early genes" often associated with cellular stress, activation, or hypoxia. Combined with PDGFRA and VEGFA, this is likely an activated, pro-angiogenic fibroblast subpopulation.
+#Cluster 15	Proliferating Muscle-like (See Note)	HMGB2 and TOP2A are strong markers of active cell division (G2/M phase). However, TTN, TNNT2, TNNC1, and MYL4 are striated/cardiac muscle markers.
+
+semsub$lvl1_clusters=ifelse(semsub$pearson_clusters_id %in% c(9,10,5,16),"Immune",ifelse(semsub$pearson_clusters_id %in% c(7,4,2,11),"Stroma","Tumor"))
+semsub@meta.data <- semsub@meta.data %>%
+  mutate(
+    lvl2_clusters = case_when(
+      pearson_clusters_id == 9 ~ "T Cells",
+      pearson_clusters_id == 10 ~ "Plasma Cells",
+      pearson_clusters_id == 5 ~ "Macrophages",
+      pearson_clusters_id == 16 ~ "Monocytes/MDSC",
+      pearson_clusters_id == 7 ~ "Endothelial Cells",
+      pearson_clusters_id == 4 ~ "Myometrium/Myofibroblasts",
+      pearson_clusters_id == 2 ~ "Fibroblasts/CAFs",
+      pearson_clusters_id == 11 ~ "Activated/Stressed Stroma",
+      TRUE                   ~ "Tumor"
+    )
+  )
+scPearsonPCA::plot_umap(umapreduc = "pearsonumap_id", clustercol = "lvl2_clusters", semuse = semsub,alpha=0.1)
+```
+#phenomaps
+```{r}
+colorpal <- c('#F0A0FF','#FFA405','#C20088','#00998F','#426600'
+              , "#4C005C" 
+              ,'#191919'
+              ,'#003380', '#005C31','#94FFB5','#990000','#0075DC','#E0FF66')
+names(colorpal) <- sort(unique(semsub@meta.data[["lvl2_clusters"]]))
+
+xyplist <- 
+lapply(split(data.table(semsub@meta.data), by = c("Run_Tissue_name","core_str")), function(xx){
+  HieraType::xyplot("lvl2_clusters", metadata = xx,ptsize = 0.1,cls = colorpal) + coord_fixed()
+}) #takes <1 minute
+
+xyplist <- lapply(xyplist, function(p) {dat <- p$data
+  ttl <- paste0(dat$Run_Tissue_name[1], "_", dat$core_str[1])
+  p + ggtitle(ttl)
+})
+xyplist
+```
+#add polygons
+```{r}
+polygons=merge(usc$polygons[usc$polygons$cell_ID %in% semsub$cell_ID,],semsub@meta.data[,c("cell_ID","core_str","id","lvl1_clusters","lvl2_clusters")])
+
+polygonslist <- 
+lapply(split(data.table(polygons), by = c("Run_Tissue_name","core_str")), function(xx){
+  ggplot(xx, aes(x_slide_mm, y_slide_mm,group = cell_ID,fill = lvl2_clusters)) +
+  geom_polygon() +
+  scale_fill_manual(values = colorpal,drop = FALSE) +
+  coord_equal() + theme_bw()
+})
+
+polygonslist <- lapply(polygonslist, function(p) {dat <- p$data
+  ttl <- paste0(dat$Run_Tissue_name[1], "_", dat$core_str[1])
+  p + ggtitle(ttl)
+})
+polygonslist
+```
+#polygons by slide
+```{r}
+polygonslistslide <- 
+lapply(split(data.table(polygons), by = "Run_Tissue_name"), function(xx){
+  ggplot(xx, aes(x_slide_mm, y_slide_mm,group = cell_ID,fill = lvl2_clusters)) +
+  geom_polygon() +
+  scale_fill_manual(values = colorpal,drop = FALSE) +
+  coord_equal() + theme_bw()
+})
+
+polygonslistslide
+
+for (nm in names(polygonslistslide)) {
+  ggsave(
+    filename = file.path(outdir, paste0(nm, ".pdf")),
+    plot = polygonslistslide[[nm]]
+    #width = 6,
+    #height = 6,
+    #dpi = 300
+  )
+}
+polygonslistslide$USC1
+#saveRDS(polygonslistslide,paste0(outdir, "/processed_data/polygons_lists_byslide.RDS")) #takes 3 minutes
+```

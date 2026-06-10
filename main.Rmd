@@ -1,0 +1,477 @@
+---
+title: "CosMx analysis"
+author: "F. Ake"
+date: "2026-05-30"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 7,
+  engine.path = list(bash = "/usr/bin/bash")
+)
+```
+
+## 1. Loading Packages
+
+```{r libraries}
+
+# Import libraries
+# ================
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(future)
+library(future.apply)
+library(data.table)
+library(openxlsx)
+library(clustree)
+library(ggthemes)
+library(Polychrome)
+library(scales)
+library(colorspace)
+library(scPearsonPCA)
+library(ggrepel)
+
+# custom functions
+source("src/custom_functions.R")
+
+# Global variables
+# ================
+COSMX_INPUTFILES_REPO = "/scratch/users/franzake/VIVEK_LAB/data/flatFiles"
+PANEL_FOV = "Hs_6k"
+FOV_MAX_PROP_LOSS = .6
+
+# QC variables
+# ============
+COUNTS_THRESHOLD_MIN = 30
+COUNTS_THRESHOLD_MAX = NULL
+AREA_THRESHOLD_MIN = NULL
+AREA_THRESHOLD_MAX = 80e3
+SBR_THRESHOLD_MIN = 0
+SBR_THRESHOLD_MAX = 7.5
+FOV_INTEGRITY_PERCENT_THRESHOLD = 0.6
+SPLIT_RATIO_THRESHOLD_MIN = NULL
+SPLIT_RATIO_THRESHOLD_MAX = log2(4)
+
+
+# Paralelise heavy steps (SCTransform, RCTD, etc.)
+# =================================================
+plan("multicore", workers = 6)
+options(future.globals.maxSize = 60 * 1024^3)  # 20 GB
+
+```
+
+```{r}
+test=gbspatial::dataprep_cosmx("/scratch/users/franzake/VIVEK_LAB/data/flatFiles",plot=T)
+
+
+tma_mat=t(openxlsx::read.xlsx("data/flatFiles/TA649/TA-649 Autoimmune Hepatitis biopsy.xlsx",sheet = 3,rows = seq(2,20,3),cols = 1:11,colNames = F)[,-1])
+
+library(gbspatial)
+
+tmamapping <- gbspatial::assign_fovs_to_cores(#USC5_247 has issues
+  fov_input = list.files("/scratch/users/franzake/VIVEK_LAB/data/flatFiles", pattern = "_fov_positions_file\\.csv\\.gz$",recursive = TRUE, full.names = TRUE),
+  slidelabels = unique(test$metadata$Run_Tissue_name),
+  cell_input = split(test$metadata, test$metadata$Run_Tissue_name),
+  tma_map_input = list(tma_mat)
+  )
+tmamapping$plots$`TA 649`$Whole_Slide_by_Column
+tmamapping$mapped_data[tmamapping$mapped_data$FOV=="TA 649_23",c("core_col","core_row","core_str","id")]=tmamapping$mapped_data[tmamapping$mapped_data$FOV=="TA 649_24",c("core_col","core_row","core_str","id")]
+tmamapping$plots$`TA 649`$Whole_Slide_by_Column
+View(tmamapping$mapped_data)
+
+tma_mat
+```
+
+## 2. Input files
+
+Here are the input files that have to be analyzed...
+
+```{r list_files}
+# Sys.which("bash")
+# Preview the data directory structure
+system("/oak/stanford/groups/bhowitt/conda_envs/workspace/bin/eza -T -L 4 .")
+```
+
+## 3. Load CosMx data
+
+```{r data_loading}
+# Call the function
+usc = readCosMx(experiment_repo = COSMX_INPUTFILES_REPO)
+usc
+
+#check TMA & FOvs
+TmaPlot(usc, col.by = "FOV")
+```
+
+## 4. Quality control
+
+####  - nCounts v nFeatureRNA
+Assesses transcriptomic complexity and overall cell quality. 
+Cells with very low counts and features are typically low-quality cells, empty segmentations, or background signal.
+Extremely high counts may indicate merged cells or segmentation artifacts.
+
+####  - nCounts v Area
+Evaluates segmentation consistency. Larger cells are expected to contain more transcripts.
+Very small cells often correspond to debris or segmentation fragments, while extremely large cells may represent merged cells or segmentation errors.
+
+#### - SBR v nCounts
+Measures transcript detection quality relative to imaging background noise. 
+Low SBR values indicate poor-quality or noisy detections and are generally filtered out. 
+Extremely high outliers may represent imaging artifacts and should be inspected spatially.
+
+#### - SplitRatioToLocal vs Area
+Quality metric associated with cell fragmentation or over-segmentation. 
+High values may indicate unstable or incorrect cell boundaries. 
+Filtering cells with abnormal split ratios improves transcript assignment accuracy and downstream spatial analysis robustness.
+
+
+```{r qc_controls_and_filtering}
+
+
+# Check QC metrics on RAW
+# =======================
+
+# Compute FOV integrity
+usc = computeFOVintegrity(usc, max_prop_loss = FOV_MAX_PROP_LOSS, panel_name = PANEL_FOV)
+# Compute_SBRcomp
+usc = computeSBR(usc)
+#log2 SplitRatioToLocal
+usc$SplitRatioToLocal_log2 = log2(usc$SplitRatioToLocal)
+
+# visualization
+# =============
+# TmaPlot(usc, col.by = "fov_signal_loss", pt.size = 0.01)
+# TmaPlot(usc, col.by = "flag_fov_integrity")
+# TmaPlot(subset(usc), col.by = "log2SBR")
+# TmaPlot(usc, col.by = "SplitRatioToLocal_log2")
+
+
+# Check QC metrics with threshold with RAW data
+# =============================================
+plots = plotQCs(
+  usc, 
+  count_min = COUNTS_THRESHOLD_MIN, 
+  count_max = COUNTS_THRESHOLD_MAX, 
+  area_min = AREA_THRESHOLD_MIN, 
+  area_max = AREA_THRESHOLD_MAX, 
+  sbr_min = SBR_THRESHOLD_MIN, 
+  sbr_max = SBR_THRESHOLD_MAX, 
+  split_ratio_min = SPLIT_RATIO_THRESHOLD_MIN, 
+  split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX, 
+  base_size = 15) %>% 
+  patchwork::wrap_plots(., nrow=4)
+plots
+
+
+# Apply QC filtering developed by Giuseppe
+# ========================================
+usc_qc <- QCfiltering(
+  usc, 
+  count_min = COUNTS_THRESHOLD_MIN, 
+  count_max = COUNTS_THRESHOLD_MAX, 
+  area_min = AREA_THRESHOLD_MIN, 
+  area_max = AREA_THRESHOLD_MAX, 
+  fov_integrity_threshold = FOV_INTEGRITY_PERCENT_THRESHOLD, 
+  sbr_min = SBR_THRESHOLD_MIN, 
+  sbr_max = SBR_THRESHOLD_MAX, 
+  split_ratio_min = SPLIT_RATIO_THRESHOLD_MIN, 
+  split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX)
+ 
+plots_qcs = plotQCs(
+  usc_qc, 
+  count_min = COUNTS_THRESHOLD_MIN, 
+  count_max = COUNTS_THRESHOLD_MAX, 
+  area_min = AREA_THRESHOLD_MIN, 
+  area_max = AREA_THRESHOLD_MAX, 
+  sbr_min = SBR_THRESHOLD_MIN, 
+  sbr_max = SBR_THRESHOLD_MAX, 
+  split_ratio_min = SPLIT_RATIO_THRESHOLD_MIN, 
+  split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX, 
+  base_size = 15) %>% 
+  patchwork::wrap_plots(., nrow=4)
+plots_qcs
+
+#Upset plots
+usc_qc@misc$qc_plots$upset
+
+
+```
+
+
+####  - Assignation of FOV to adequate cores
+
+```{r assignation_of_fov_to_cores}
+
+# Global variables & be careful about eventual rotation
+# =====================================================
+tma_mat = parseTMAmap("data/flatFiles/TA649/TA-649 Autoimmune Hepatitis biopsy.xlsx") %>% t(); tma_mat
+
+#Let'0s replace NA by "Control" here
+tma_mat[is.na(tma_mat)] <- "control"
+
+# Extract clinical metadata
+# ==========================
+usc_qc <- assignCoresToCells(usc_qc,
+ tma_map       = tma_mat,
+ fov_positions = as.data.frame(fread("data/flatFiles/TA649/TA649_fov_positions_file.csv.gz")), core_drift_tolerance = 0.40
+)
+usc_qc@misc$fov_core_plots$TA649$Whole_Slide_by_Row
+usc_qc@misc$fov_core_plots$TA649$Whole_Slide_by_Column
+
+# Manual Reassing FOV to cores
+# ============================
+usc_qc$core_str = (usc_qc@meta.data %>% dplyr::mutate(core_str = ifelse(fov==182, "C2R3", core_str)))$core_str
+usc_qc$sample_id = (usc_qc@meta.data %>% dplyr::mutate(sample_id = ifelse(fov==182, "37170", sample_id)))$sample_id
+
+
+# Visualization
+# =============
+
+#sampleID assignations
+sample_cols = c(
+     "#E41A1C", "#377EB8", "#4DAF4A", "#FF7F00",
+     "#984EA3", "#A65628", "#F781BF", "#FFED6F",
+     "#00CED1", "#8B0000", "#006400", "#FF6347",
+     "#4B0082", "#2E8B57"
+   )
+TmaPlot(usc_qc, col.by = "sample_id", label = T, cols = sample_cols, dark = T)
+
+```
+
+
+
+## 5. Dimensionality reduction
+
+### Approach 1 : regular Dimensionality reduction - SCT normalization...
+
+```{r dimensionality_reduction_noBatch_correction}
+
+# Let's employ first Seurat approach (1)
+# ==================================
+
+# Find Variable Features
+# ----------------------
+usc_qc = FindVariableFeatures(usc_qc, nfeatures = 2000)
+
+# Normalization using scTransform approach
+# ----------------------------------------
+usc_qc = SCTransform(
+  usc_qc, 
+  assay = "RNA", 
+  vars.to.regress = c("nCount_RNA", "nFeature_RNA"),
+  clip.range = c(-10, 10))
+
+# PCA computation
+# ---------------
+usc_qc = RunPCA(usc_qc, npcs = 30, assay = "SCT")
+ElbowPlot(usc_qc, ndims = 50)
+NPCS = 10
+
+# RunUMAP
+# -------
+usc_qc = RunUMAP(usc_qc, dims = 1:NPCS, reduction = "pca")
+UMAP.plot0 = DimPlot(usc_qc, group.by = "sample_id", label = T, reduction = "umap") +
+  ggtitle("UMAP: No Batch correction  - SCT normalization") 
+UMAP.plot0
+
+```
+
+Clear Batch effect associated to the sample observed...
+
+### Approach 2 : regular Dimensionality reduction - SCT normalization...
+
+```{r DR_with_harmony_batch_correction}
+
+# Perform Harmony with Batch correction on Sample_ID using prior PCA
+# ------------------------------------------------------------------
+tmp_00 = usc_qc[["pca"]]
+harmony_embedding1 = harmony::RunHarmony(
+  usc_qc[["pca"]]@cell.embeddings,
+  meta_data = usc_qc@meta.data,
+  vars_use = "sample_id")
+tmp_00@cell.embeddings = harmony_embedding1
+usc_qc[["pca_harmony"]] = tmp_00
+
+
+# RunUMAP
+# -------
+usc_qc[["umap_sct_harmony"]] = (RunUMAP(usc_qc, reduction = "pca_harmony", dims = 1:NPCS))@reductions$umap
+UMAP.plot1 = DimPlot(usc_qc, group.by = "sample_id", label = T, reduction = "umap_sct_harmony", pt.size = 1.5) +
+  ggtitle("UMAP: No Batch correction  - SCT normalization")
+UMAP.plot1
+
+```
+
+
+There is this glob effect thet reflect a poor performance of the SCT norm for the
+dimensionality reduction...
+
+
+Let's employ the Pearson approach from Bruker....
+
+```{r scPearson_approach_with_batch_integration}
+
+DefaultAssay(usc_qc) = "RNA"
+
+# total counts per cell (across all genes)
+tc <- Matrix::colSums(usc_qc[["RNA"]]$counts)
+
+# Calculate Gene-Frequency by Batch
+genefreq_batch = gene_frequency(
+  usc_qc[["RNA"]]$counts, 
+  obs = data.table(usc_qc@meta.data)[,.(cell_ID, sample_id)], 
+  cellid_colname = "cell_ID", 
+  batch_variable = "sample_id")
+
+# RunPCA with Batch effect correction
+tmp_00 = (sparse_quasipoisson_pca_seurat_batch(
+  usc_qc[["RNA"]]$counts[hvgs,],
+  totalcounts = tc,
+  grate = genefreq_batch[hvgs,],
+  obs =data.table(usc_qc@meta.data)[,.(cell_ID, sample_id)],
+  batch_variable = "sample_id", 
+  cellid_colname = "cell_ID",
+  scale.max = 10,
+  do.scale = TRUE,
+  do.center = TRUE))
+usc_qc[["pearson_pca_batch"]] = tmp_00$reduction.data
+
+# RunPCA with Batch effect
+tmp_01 = scPearsonPCA::make_umap(tmp_00)
+usc_qc[["pearson_umap_batch"]] = tmp_01$ump
+usc_qc[["pearson_graph_batch"]] = Seurat::as.Graph(tmp_01$grph)
+
+# UMAP visualization
+UMAP.plot2 = DimPlot(usc_qc, reduction = "pearson_umap_batch", group.by = "sample_id", pt.size = 1.5) +
+  ggtitle("UMAP visualization - Batch corrected")
+UMAP.plot2
+
+```
+
+Is there any lowQC area that can be identified?
+
+```{r more_on_QC}
+
+lapply(c("nCount_RNA", "nFeature_RNA"), function(x) {
+  FeaturePlot(usc_qc, feature = x, order = T, raster=F, assay="SCT") + ggthemes::theme_clean()
+}) %>% patchwork::wrap_plots(nrow=2)
+
+```
+
+
+```{r scPearson_approach_with_harmony_batch_on_pearson_pca}
+
+DefaultAssay(usc_qc) = "RNA"
+
+# total counts per cell (across all genes)
+tc <- Matrix::colSums(usc_qc[["RNA"]]$counts)
+
+# PearsonPCA
+genefreq <- scPearsonPCA::gene_frequency(usc_qc[["RNA"]]$counts)
+
+# Find Var features
+usc_qc = Seurat::FindVariableFeatures(usc_qc, nfeatures = 2000)
+hvgs <- VariableFeatures(usc_qc)
+
+# PCA
+tmp_02 =sparse_quasipoisson_pca_seurat(
+  usc_qc[["RNA"]]$counts[hvgs,],
+  totalcounts = tc,
+  grate = genefreq[hvgs],
+  scale.max = 10,
+  do.scale = TRUE,
+  do.center = TRUE)
+
+# Perform Harmony with Batch correction on Sample_ID
+harmony_embedding2 = harmony::RunHarmony(
+  tmp_02$reduction.data@cell.embeddings,
+  meta_data = usc_qc@meta.data,
+  vars_use = "sample_id")
+# reassign embedding to those of Harmony
+tmp_02$reduction.data@cell.embeddings = harmony_embedding2
+
+# umap
+tmp_03 = scPearsonPCA::make_umap(tmp_02)
+
+# assignation of new embeddings to the right slot in Seurat object
+usc_qc[["pearson_pca_harmony"]] = tmp_02$reduction.data
+
+
+# RunUMAP
+usc_qc[["pearson_umap_sct_harmony"]] = (RunUMAP(usc_qc, reduction = "pearson_pca_harmony", dims = 1:13))@reductions$umap
+UMAP.plot3 = DimPlot(usc_qc, group.by = "sample_id", label = T, reduction = "pearson_umap_sct_harmony", pt.size = 1.5) +
+  theme(legend.position = "none") +
+  ggtitle("UMAP: Harmony Batch correction  - scPearson normalization")
+UMAP.plot3
+
+```
+
+
+## 6. Clustering & cell-type characterization
+
+```{r ctype_annotation}
+
+# Find Expression TopMarkers in each clusters
+Idents(usc_qc) = usc_qc$seurat_clusters
+usc.markers = data.table(FindAllMarkers(usc_qc, assay = "SCT", only.pos = T))
+usc.markers
+
+
+# let's check the average expression of the tops markers in the clusters
+top5.markers = (usc.markers %>% group_by(cluster) %>% slice_head(n=30)) %>% data.table()
+
+avg.mat = data.frame(AverageExpression(usc_qc[top5.markers$gene,], group.by = "seurat_clusters", layer = "counts")[["SCT"]])
+pheatmap::pheatmap(avg.mat, scale = "row", display_numbers = T)
+
+
+jci_insight_markers = list(
+  "Kupffer_cells/Macrophages" = c("C1QC", "C1QB", "C1QA", "MARCO"),
+  "Hepatocytes" = c("SLC27A5", "ADH4", "SLC2A2", "ARG1", "CYP4A11"),
+  "HSCs" = c("COL1A1", "COL3A1", "DCN", "TAGLN", "SPARC"),
+  "Periportal_hepatocytes" = c("SAA1", "CRP", "FBP1", "ASS1", "PCK1"),
+  "Epithelial_cells" = c("KRT18", "PTK2", "SIGMAR1", "VPS29", "MED15"),
+  "Stressed_midzonal_hepatocytes" = c("HAMP", "FOS", "JUND", "SERPINE1", "CXCL2"),
+  "Plasma_cells_1" = c("IGKC", "IGHG1/2", "JCHAIN", "MZB1", "IGHA1"),
+  "IFN_stressed_hepatocytes" = c("CXCL9", "CXCL10", "STAT1", "HLA-G", "HLA-F"),
+  "Plasma_cells_2" = c("IGLC1/2", "IGLL5", "IGKC", "IGHG1/2", "JCHAIN"),
+  "Pericentral_hepatocytes" = c("GLUL", "TDO2", "FKBP5", "MGST1", "HSD11B1"),
+  "Cholangiocytes" = c("KRT7", "KRT8", "TACSTD2", "MMP7", "SPP1")
+)
+
+# Generate Feature Plots
+plots = lapply(names(jci_insight_markers)[1:2], function(x){
+  message(x)
+  p = FeaturePlot(usc_qc, features = jci_insight_markers[[x]], order=T, raster=F, combine = F)
+  p = lapply(p, function(x) x + theme(legend.position = "none"))
+  patchwork::wrap_plots(p, nrow=1)
+})
+
+patchwork::wrap_plots(plots, nrow=2)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

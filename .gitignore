@@ -1,0 +1,19 @@
+# R session artifacts
+.Rhistory
+.RData
+.Rprofile
+session.RData
+*.Rout
+
+# RStudio / Posit
+.Rproj.user/
+.positai/
+
+# Large data files — raw flatFiles and pre-built Seurat objects
+data/flatFiles/
+data/*.RDS
+data/session.RData
+
+# OS / editor
+.DS_Store
+Thumbs.db
