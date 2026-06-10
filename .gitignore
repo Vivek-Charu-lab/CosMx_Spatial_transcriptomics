@@ -14,6 +14,9 @@ data/flatFiles/
 data/*.RDS
 data/session.RData
 
+# HPC launcher scripts
+bin/
+
 # OS / editor
 .DS_Store
 Thumbs.db
