@@ -1,12 +1,11 @@
-# CosMx Spatial Transcriptomics — TA649
-
-Analysis repository for **Nanostring CosMx SMI** spatial transcriptomics data from the **Vivek Charu Lab** (Stanford University).
+# CosMx Spatial Transcriptomics
+Analysis repository for **Nanostring CosMx SMI** spatial transcriptomics data
 
 ---
 
 ## Overview
 
-This repository contains the full computational and statistical analysis pipeline for CosMx spatial transcriptomics data, currently applied to sample **TA649** — a TMA (Tissue Microarray) cohort of **Autoimmune Hepatitis (AIH)** liver biopsies profiled with the **Human RNA 6k Discovery panel** (~6,000 genes, 182 FOVs, ~126,000 cells).
+This repository contains the full computational and statistical analysis pipeline for CosMx spatial transcriptomics data.
 
 The work covers the complete analysis workflow from raw flat-file ingestion through quality control, dimensionality reduction, clustering, and cell-type annotation, with an emphasis on spatially-aware methods suited to multiplexed imaging transcriptomics.
 
@@ -57,8 +56,7 @@ Four embedding strategies are compared:
 ### 5. Clustering & Cell-Type Annotation
 Seurat graph-based clustering with resolution sweep (`clustree`). Cell types annotated using:
 - Unsupervised marker discovery (`FindAllMarkers`)
-- Known AIH/liver marker panels (Kupffer cells, hepatocytes, HSCs, cholangiocytes, plasma cells, etc.)
-- CellMarker 2.0 database cross-reference
+- Known AIH/liver marker panels
 - Nanostring liver reference label transfer (in development)
 
 ---
@@ -77,31 +75,3 @@ Seurat graph-based clustering with resolution sweep (`clustree`). Cell types ann
 | `clustree` | Clustering resolution sweep |
 | `dbscan` | Spatial smoothing (SBR computation) |
 | `openxlsx` | TMA construction-key parsing |
-
-### Environment
-Analysis runs in a managed conda environment on the Stanford HPC (Sherlock):
-```
-/oak/stanford/groups/bhowitt/conda_envs/workspace
-```
-
----
-
-## Running the Analysis
-
-Open the project in **RStudio / Posit** and knit `main.Rmd`, or from the R console:
-
-```r
-rmarkdown::render("main.Rmd")
-```
-
-Parallelism is configured at the top of `main.Rmd`:
-```r
-plan("multicore", workers = 6)
-options(future.globals.maxSize = 60 * 1024^3)
-```
-
----
-
-## Author
-
-**Franz Ake** — Vivek Charu Lab, Stanford University
