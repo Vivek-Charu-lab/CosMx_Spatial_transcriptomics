@@ -41,6 +41,30 @@ The work covers the complete analysis workflow from raw flat-file ingestion thro
 
 ---
 
+## Data Access
+
+Raw flat files (~2.6 GB) are **not tracked in git** but are shared with all lab members via **Box**:
+
+```
+Box: CosMX AIH/TA649/flatFiles/
+```
+
+To sync locally using `rclone` (requires Box remote configured as `box`):
+
+```bash
+# Download flat files to local data/ directory
+rclone copy "box:CosMX AIH/TA649/flatFiles" data/flatFiles/TA649/ --progress
+
+# Upload / sync local flat files back to Box
+rclone copy data/flatFiles/ "box:CosMX AIH/TA649/flatFiles" --progress
+```
+
+> **Note:** The `TA649_exprMat_file.csv.gz` and `TA649_tx_file.csv.gz` are large files (>2 GB). If `rclone` reports a `duplicate_part_id` multipart upload error, simply re-run the command — it will skip already-transferred files and retry the failed one.
+
+The QC-filtered Seurat object (`data/seurat_obj.RDS`, 335 MB) is available directly from this repository via **Git LFS**.
+
+---
+
 ## Analysis Pipeline
 
 ### 1. Data Ingestion
