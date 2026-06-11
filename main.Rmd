@@ -9,7 +9,7 @@ output:
     toc_depth: 3
     code_folding: show
 editor_options: 
-  chunk_output_type: console
+  chunk_output_type: inline
 ---
 
 ```{r setup, include=FALSE}
@@ -23,7 +23,7 @@ knitr::opts_chunk$set(
 )
 ```
 
----
+------------------------------------------------------------------------
 
 ## Ideas & Tasks to Develop
 
@@ -39,13 +39,13 @@ knitr::opts_chunk$set(
 
 - **Cell segmentation plot function** — develop a `plotSegmentation(obj, col.by, ...)` function that reads polygon vertex coordinates stored in `obj@misc$polygons` (or directly from Seurat FOV spatial data) and renders filled cell outlines with `ggplot2` (`geom_polygon`), colouring each cell by any `@meta.data` column. Useful for spatially contextualising cluster assignments and QC flags. *Discuss feasibility and design with Karan before implementing.*
 
----
+------------------------------------------------------------------------
 
 ## 1. Libraries & Configuration
 
 Load all required packages, define analysis constants (data paths, QC thresholds), and configure parallel execution.
 
-```{r libraries}
+```{r libraries, message=FALSE}
 library(Seurat)
 library(ggplot2)
 library(dplyr)
@@ -61,10 +61,14 @@ library(colorspace)
 library(scPearsonPCA)
 library(ggrepel)
 
-source("src/custom_functions.R")
+source("./src/custom_functions.R")
 
 # Paths & panel
-COSMX_INPUTFILES_REPO        <- "/scratch/users/franzake/VIVEK_LAB/data/flatFiles"
+
+# Path on Sherlock
+COSMX_INPUTFILES_REPO        <- "/scratch/users/franzake/CosMx_Spatial_transcriptomics/data/flatFiles/"
+# Path on Box
+COXMX_INPUTFILES_REPO2      <- " .. "
 PANEL_FOV                    <- "Hs_6k"
 FOV_MAX_PROP_LOSS            <- 0.6
 
@@ -84,17 +88,17 @@ plan("multicore", workers = 6)
 options(future.globals.maxSize = 60 * 1024^3)
 ```
 
----
+------------------------------------------------------------------------
 
 ## 2. Input Files
 
-Preview the flat-file directory tree to confirm all expected CosMx output files are present.
+Preview the flat-file directory tree to confirm all expected CosMx output files are present on my Sherlock repo.
 
 ```{r list_files}
 system("/oak/stanford/groups/bhowitt/conda_envs/workspace/bin/eza -T -L 4 .")
 ```
 
----
+------------------------------------------------------------------------
 
 ## 3. Data Loading
 
@@ -103,11 +107,14 @@ Read raw CosMx flat files into a Seurat object via `readCosMx()`. Tissue condens
 ```{r data_loading}
 usc <- readCosMx(experiment_repo = COSMX_INPUTFILES_REPO)
 usc
+```
+Let's visualize the TMA slide
 
-TmaPlot(usc, col.by = "FOV")
+```{r plot_TMA1, fig.height=11}
+TmaPlot(usc, col.by = "FOV", dark = F)
 ```
 
----
+------------------------------------------------------------------------
 
 ## 4. Quality Control
 
@@ -122,18 +129,20 @@ Four metrics are used to filter low-quality cells:
 - **SBR vs nCount** — signal-to-background ratio; low values indicate noisy or unreliable transcript detections.
 - **Split Ratio vs Area** — boundary fragmentation; high values indicate over-segmentation and poor transcript assignment.
 
+Let's calculate FOV, SBR & SplitRatioToLocal to Local scores... 
+
 ```{r qc_controls_and_filtering}
 # Compute per-cell QC metrics
 usc <- computeFOVintegrity(usc, max_prop_loss = FOV_MAX_PROP_LOSS, panel_name = PANEL_FOV)
 usc <- computeSBR(usc)
 usc <- computeSplitRatio(usc)
 usc$SplitRatioToLocal_log2 <- log2(usc$SplitRatioToLocal)
+```
 
-# Optional spatial overlays (uncomment to inspect)
-# TmaPlot(usc, col.by = "fov_signal_loss", pt.size = 0.01)
-# TmaPlot(usc, col.by = "flag_fov_integrity")
-# TmaPlot(usc, col.by = "log2SBR")
-# TmaPlot(usc, col.by = "SplitRatioToLocal_log2")
+Let's visualize the QC plots 
+Potentially can serve for adjusting the default QC parameters...
+
+```{r compute_canonicals_QC_plots}
 
 # Raw QC scatter plots with thresholds
 plots <- plotQCs(
@@ -148,7 +157,20 @@ plots <- plotQCs(
   split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX,
   base_size = 15) %>%
   patchwork::wrap_plots(nrow = 4)
+
+```
+
+Let's visualize the plots...
+
+```{r viz_QCplots, fig.height=12}
 plots
+```
+
+
+After adjustments of threshold values ... the filtering can be applied on the Seurat object
+using custom function QCfiltering...
+
+```{r compute_filtering}
 
 # Apply QC filtering
 usc_qc <- QCfiltering(
@@ -163,6 +185,12 @@ usc_qc <- QCfiltering(
   split_ratio_min         = SPLIT_RATIO_THRESHOLD_MIN,
   split_ratio_max         = SPLIT_RATIO_THRESHOLD_MAX)
 
+```
+
+Computation and visualization of QC plots following filtering...
+
+```{r compute_QCplots2}
+
 # Post-filter QC scatter plots
 plots_qcs <- plotQCs(
   usc_qc,
@@ -176,11 +204,25 @@ plots_qcs <- plotQCs(
   split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX,
   base_size = 15) %>%
   patchwork::wrap_plots(nrow = 4)
+```
+
+Visualization after filtering...
+
+```{r viz_QCplots2, fig.height=12}
 plots_qcs
+
+```
+
+
+Summarization_with_upSet_plot
+
+```{r upset_plot_summarization}
 
 # UpSet plot — overlap of filtering flags
 usc_qc@misc$qc_plots$upset
+
 ```
+
 
 ### 4.2 FOV-to-Core Assignment
 
@@ -215,7 +257,7 @@ sample_cols <- c(
 TmaPlot(usc_qc, col.by = "sample_id", label = TRUE, cols = sample_cols, dark = TRUE)
 ```
 
----
+------------------------------------------------------------------------
 
 ## 5. Dimensionality Reduction
 
@@ -350,7 +392,7 @@ lapply(c("nCount_RNA", "nFeature_RNA"), function(x) {
 }) %>% patchwork::wrap_plots(nrow = 2)
 ```
 
----
+------------------------------------------------------------------------
 
 ## 6. Clustering & Cell-Type Annotation
 
