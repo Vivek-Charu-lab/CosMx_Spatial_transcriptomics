@@ -15,14 +15,27 @@ The work covers the complete analysis workflow from raw flat-file ingestion thro
 
 ```
 .
-├── main.Rmd                  # Primary analysis notebook
+├── main.Rmd                        # Primary analysis notebook
 ├── src/
-│   ├── custom_functions.R    # Franz's Seurat-native CosMx pipeline
-│   └── prep_cosmx.R          # Giuseppe's reference pipeline (gbspatial)
+│   ├── custom_functions.R          # Franz's Seurat-native CosMx pipeline
+│   ├── prep_cosmx.R                # Giuseppe's reference data prep pipeline
+│   └── gb_model.Rmd                # Giuseppe's full reference workflow notebook
 ├── data/
-│   ├── flatFiles/            # Raw CosMx flat files (gitignored)
-│   └── md5sum/               # Integrity checksums for raw data
-├── doc/                      # Notes and documentation
+│   ├── flatFiles/                  # Raw CosMx flat files (gitignored)
+│   │   └── TA649/
+│   │       ├── TA649_exprMat_file.csv.gz
+│   │       ├── TA649_metadata_file.csv.gz
+│   │       ├── TA649_tx_file.csv.gz
+│   │       ├── TA649-polygons.csv.gz
+│   │       ├── TA649_fov_positions_file.csv.gz
+│   │       └── TA-649 Autoimmune Hepatitis biopsy.xlsx  # TMA construction key
+│   ├── seurat_obj.RDS              # QC-filtered Seurat snapshot (Git LFS, 335 MB)
+│   └── md5sum/
+│       └── md5sum_flatFiles.csv    # Integrity checksums for raw flat files
+├── doc/
+│   └── session_custom_functions.md # Notes on custom function development
+├── .gitattributes                  # Git LFS tracking rules
+├── .gitignore
 └── CosMx_Spatial_transcriptomics.Rproj
 ```
 
