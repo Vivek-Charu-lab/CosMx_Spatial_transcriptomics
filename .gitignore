@@ -34,3 +34,5 @@ bin/
 .DS_Store
 Thumbs.db
 
+
+# Un-ignore QC Seurat snapshot (tracked via Git LFS)
