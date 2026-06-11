@@ -209,3 +209,47 @@ Known cell-type marker panels for this dataset (Autoimmune Hepatitis / liver):
 - **Core R packages**: `Seurat` (v5), `SeuratObject`, `Matrix`, `data.table`, `future`/`future.apply`, `ggplot2`, `dplyr`, `dbscan` (required by `computeSBR()`), `openxlsx` (required by `parseTMAmap()`), `clustree` (resolution sweep visualization)
 - **Lab-specific packages**: `gbspatial` (Giuseppe's — `dataprep_cosmx()`, `run_spatial_qc()`, `assign_fovs_to_cores()`), `scPearsonPCA` (quasi-Poisson PCA + UMAP), `HieraType` (cluster markers + cell typing)
 - **Python alternative**: `squidpy`, `scanpy`, `spatialdata` with `spatialdata-io` CosMx reader
+
+## Session Log
+
+### 2026-06-10 / 2026-06-11
+
+**Completed this session:**
+- `main.Rmd` restructured: 6 numbered `##` sections, `###` subsections, consistent `<-` assignment, horizontal rules
+- Added **Ideas & Tasks to Develop** section (top of notebook) with 3 items from team meeting:
+  1. Transfer learning from Nanostring liver reference (Azimuth / `FindTransferAnchors`)
+  2. Manual annotation + CellMarker 2.0 cross-reference
+  3. `plotSegmentation()` function using polygon vertices + ggplot2 — discuss design with Karan first
+- Bug fix: added missing `computeSplitRatio(usc)` call in §4.1
+- Removed orphaned `gbspatial::dataprep_cosmx` scratch chunk (broke knitting via `View()`)
+- `README.md` created with project overview, pipeline stages, dependency tables, rclone/Box data access instructions
+- `.gitignore` extended: `*.bak`, `*.orig`, notebook cache/HTML/PDF, `*.rds`
+- Repo transferred: `franzake/` → `Vivek-Charu-lab/CosMx_Spatial_transcriptomics`
+- Git remote updated locally; `~/.gitconfig` fixed (broken `gh` path: `miniforge3` → `/share/software/user/open/gh/2.88.1/bin/gh`)
+- Git LFS configured: `data/seurat_obj.RDS` (335 MB) tracked and pushed
+- Raw flat files (~2.6 GB) synced to Box: `CosMX AIH/TA649/flatFiles/`
+
+**Current state of `main.Rmd`:**
+
+| Section | Status |
+|---|---|
+| §1 Libraries & Configuration | ✅ |
+| §2 Input Files | ✅ |
+| §3 Data Loading | ✅ |
+| §4.1 QC Metrics | ✅ |
+| §4.2 FOV-to-Core Assignment | ✅ |
+| §5.1–5.4 Dimensionality Reduction | ✅ (4 approaches compared) |
+| §6.1 Marker Discovery | ✅ (needs cluster resolution choice) |
+| §6.2 Cell-Type Annotation | 🔄 Feature plots for first 2 panels only |
+
+**Next steps:**
+- Choose final DR approach (§5.1–5.4) and run `FindClusters` + `clustree` resolution sweep
+- Complete cell-type annotation for all 11 `jci_insight_markers` panels
+- Transfer learning pipeline from Nanostring liver reference
+- `plotSegmentation()` — discuss with Karan before implementing
+- Manual annotation refinement with CellMarker 2.0
+
+**Environment notes:**
+- Git LFS binary must be in PATH for pushes: `export PATH="/share/software/user/open/git-lfs/2.4.0/bin:$PATH"`
+- `gh` CLI: `/share/software/user/open/gh/2.88.1/bin/gh`
+- HPC: Stanford Sherlock (`sh02-ln04`), project at `/scratch/users/franzake/CosMx_Spatial_transcriptomics`
