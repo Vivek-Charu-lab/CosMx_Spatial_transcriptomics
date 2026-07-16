@@ -1,0 +1,584 @@
+---
+title: "Testing CosMx analysis"
+output: github_document
+author: "Jose Liboy Lugo"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## GitHub Documents
+
+This is an R Markdown format used for publishing markdown documents to GitHub. When you click the **Knit** button all R code chunks are run and a markdown file (.md) suitable for publishing to GitHub is generated.
+
+## Including Code
+
+You can include R code in the document as follows:
+
+```{r Loading libraries and setting up directories}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(data.table)
+
+date <- Sys.Date()
+source("cosmxqc_functions.r")
+
+                         
+COSMX_INPUTFILES_REPO        <- "/scratch/users/jliboy/FT/JL01/Flatfiles"
+COSMX_OUTPUTFILES_REPO       <- "/home/users/jliboy/research_projects/FT/JL01/prelim_data/"
+PANEL_FOV                    <- "Hs_UCC"
+PANEL_PLEX                   <- 1000
+NEG_PANEL_PLEX               <- 10
+FOV_MAX_PROP_LOSS            <- 0.6
+
+# QC thresholds
+COUNTS_THRESHOLD_MIN          <- 20
+COUNTS_THRESHOLD_MAX          <- NULL
+AREA_THRESHOLD_MIN            <- NULL
+AREA_THRESHOLD_MAX            <- 60e3
+SBR_THRESHOLD_MIN             <- 0
+SBR_THRESHOLD_MAX             <- NULL
+FOV_INTEGRITY_PERCENT_THRESHOLD <- 0.6
+SPLIT_RATIO_THRESHOLD_MIN     <- NULL
+SPLIT_RATIO_THRESHOLD_MAX     <- log2(4)
+```
+
+## Loading merged seurat object. 
+
+In this section, CosMx seurat objects are loaded into R using the `readCosMxSeurat` function. 
+The resulting object, `ft`, is a Seurat object that contains the data and metadata for the CosMx experiment.
+
+```{r dataprep} 
+options(future.globals.maxSize = 100 * 1024^3) 
+ft <- readCosMxSeurat(experiment_repo = COSMX_INPUTFILES_REPO)
+ft
+```
+
+## Plotting FOV QC metrics to evaluate data quality before running cell QC
+
+``` {r plotting data qc per fov}
+
+#Plotting mean transcript per cell per fov. 
+fov_positions <- fov_plotting(COSMX_INPUTFILES_REPO, ft)
+
+#Saving fov qc plots
+for (i in seq_along(fov_positions)) {
+  ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_fov_qc_plots_", names(fov_positions)[[i]], ".png"), plot = fov_positions[[i]], width = 10, height = 8, units = "in")
+}
+
+#Plotting mean transcript per cell per fov boxplots
+meantranscript_per_cell_per_fov_boxplot <- fov_box_plot(ft)
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_meantranscript_per_cell_per_fov_boxplot.png"), plot = meantranscript_per_cell_per_fov_boxplot, width = 10, height = 8, units = "in")
+
+#Plotting mean staining intensity by slide and marker
+staining_qc_plot <- staining_qc_plot(ft)
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_staining_qc_plot.png"), plot = staining_qc_plot, width = 10, height = 8, units = "in")
+
+#Creating a slide QC table summarizing key QC metrics for each slide. 
+qc_table <- slide_qc_table(ft, PANEL_PLEX, NEG_PANEL_PLEX)
+write.csv(qc_table, file = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_slide_qc_table.csv"), row.names = FALSE)
+
+
+```
+
+## Runing cell and FOV QC
+
+```{r running cell qc}
+
+ft <- computeFOVintegrity(ft, max_prop_loss = FOV_MAX_PROP_LOSS, panel_name = PANEL_FOV)
+ft <- computeSBR(ft)
+ft <- computeSplitRatio(ft)
+ft$SplitRatioToLocal_log2 <- log2(ft$SplitRatioToLocal)
+
+```
+## Plotting the QC results 
+
+```{r plotting qc}
+library(dplyr)
+# Raw QC scatter plots with thresholds
+plots <- plotQCs(
+  ft,
+  count_min       = COUNTS_THRESHOLD_MIN,
+  count_max       = COUNTS_THRESHOLD_MAX,
+  area_min        = AREA_THRESHOLD_MIN,
+  area_max        = AREA_THRESHOLD_MAX,
+  sbr_min         = SBR_THRESHOLD_MIN,
+  sbr_max         = SBR_THRESHOLD_MAX,
+  split_ratio_min = SPLIT_RATIO_THRESHOLD_MIN,
+  split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX,
+  base_size = 15) %>%
+  patchwork::wrap_plots(nrow = 4)
+
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_qc_plots.png"), plot = plots, width = 10, height = 15, units = "in")
+
+```
+
+## FLagging cells based on the fov and cell QCs. 
+
+Notice that I am not removing cells, just flagging. 
+
+```{r flagging cells based on qc}
+
+ft <- qc_flagging(
+  ft,
+  count_min               = COUNTS_THRESHOLD_MIN,
+  count_max               = COUNTS_THRESHOLD_MAX,
+  area_min                = AREA_THRESHOLD_MIN,
+  area_max                = AREA_THRESHOLD_MAX,
+  fov_integrity_threshold = FOV_INTEGRITY_PERCENT_THRESHOLD,
+  sbr_min                 = SBR_THRESHOLD_MIN,
+  sbr_max                 = SBR_THRESHOLD_MAX,
+  split_ratio_min         = SPLIT_RATIO_THRESHOLD_MIN,
+  split_ratio_max         = SPLIT_RATIO_THRESHOLD_MAX)
+
+```
+
+## Saving flagged metadata for visualization in napari
+
+I am doing this step because I want to be able to inspect the flagging on napari. The name of the metadata file should have 
+the "_metadata.csv" sufix in order to be read by the cosmx-napari software. 
+
+``` {r saving metadata}
+
+#Saving metadata files for each slide for napari
+slidenames <- unique(ft$slidename)
+md <- ft@meta.data
+for (i in seq_along(slidenames)) {
+  md_sub <- md %>%
+  filter(slidename == slidenames[i]) %>%
+  select(starts_with("flag_"), cell_ID)
+  
+  rownames(md_sub) <- NULL
+  md_sub <- md_sub %>% relocate(cell_ID) # moves cell_ID to first column position
+  write.csv(
+  md_sub,
+  file = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_", slidenames[i], "_metadata.csv"),
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+}
+```
+
+
+## Removing flagged cells for downstream analysis
+
+In this section, I am subsetting the seurat object to only include cells with 'flag_overall' == FALSE
+
+``` {r removing flagged cells}
+
+#remove flagged cells
+ft <- subset(ft, ft$flag_overall == FALSE)
+ft
+
+```
+
+
+## Mapping TMA cores with a map keys
+
+In this section, I am subsetting the the seurat object to only process cells corresponding to the TMA. 
+I have to do this because not all slides are TMAs. 
+
+``` {r tma mapping}
+
+#Subsetting seurat object with just the TMA slide. 
+ft_tma <- subset(ft, slidename == "FTOtherCATMA")
+
+
+#visualize TMA 
+tma_plot <- TmaPlot(ft_tma, col.by = "FOV", dark = F)
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_tma_plot.png"), plot = tma_plot, width = 8, height = 6, units = "in")
+
+```
+
+## Assingning patient IDs to each core
+
+In this section, I am using the `assignCoresToCells()` function to assing patient IDs 
+to each individual core. 
+
+At the end, I removed FOVs with mislabeled cells. I figured that it is easier to remove those 
+FOVs, rather than relabeling cells. 
+
+``` {r core assignment}
+
+tma_map <- readxl::read_excel(path = paste0(COSMX_INPUTFILES_REPO, "/FT-not brca and other ca tma maps.xlsx"), 
+sheet = "FT- OTHER CA TMA Map", col_names = FALSE) 
+
+tma_map <- as.matrix(tma_map)
+tma_map <- matrix(sub(",.*", "", tma_map), nrow = nrow(tma_map), ncol = ncol(tma_map))
+tma_map[tma_map == "" | tma_map == "NA" | tma_map == "NULL"] <- NA
+
+tma_map <- tma_map[nrow(tma_map):1, ] # flip rows to match TmaPlot orientation
+
+fov_positions <- read.csv(file = paste0(COSMX_INPUTFILES_REPO, "/FTOtherCATMA/FTOtherCATMA_fov_positions_file.csv.gz"))
+
+ft_tma <- assignCoresToCells(obj = ft_tma, tma_map = tma_map, fov_positions = fov_positions)
+
+fov_columns_coreplot <- ft_tma@misc$fov_core_plots$FTOtherCATMA$Whole_Slide_by_Column
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_tma_fov_column.png"), plot = fov_columns_coreplot, width = 8, height = 6, units = "in")
+
+tma_plot <- TmaPlot(ft_tma, col.by = "sample_id_col", dark = F)
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_tma_sampleid.png"), plot = tma_plot, width = 8, height = 6, units = "in")
+
+#Filter TMA to remove mislabeled FOVs. 
+exclude_fov <- c(28, 29, 30, 67, 69, 70, 71, 77, 95, 108, 109, 110, 111, 113, 114, 
+                  241, 242, 243, 245, 246, 247, 248, 278, 279, 280, 281, 282, 283, 
+                  284, 285, 286, 331, 332, 333, 334, 335, 336, 337, 338, 339, 340)
+
+ft_tma <- subset(ft_tma, !(FOV %in% exclude_fov))
+
+
+#Add patient ID to the original suerat object
+ft$patient_id <- ft$slidename
+ft$patient_id <- ft_tma$sample_id_col[match(ft_tma$global_cell_ID, ft$global_cell_ID)] #Adding sample IDs to the main Seurat object.
+
+#Removing cells labeled as FTOtherCATMA, because these correspond to excluded FOVs. 
+ft <- subset(ft, patient_id != 'FTOtherCATMA')
+
+
+```
+
+## Processing merged seurat object with log-normalization for individual slides
+
+I am normalizing each individual slide afte splitting the seurat obejct layers. 
+
+``` {r processing seurat object}
+
+ft[["RNA"]] <- split(ft[["RNA"]], f = ft$slidename) #Split layers by slide name to process each slide individually.
+
+ft <- NormalizeData(ft, normalization.method = "LogNormalize")
+ft <- FindVariableFeatures(ft, selection.method = "vst", nfeatures = 900)
+
+all.genes <- rownames(ft)
+ft <- ScaleData(ft, features = all.genes)
+
+ft <- RunPCA(ft, reduction.name = 'log_norm_pca', npcs = 50)
+elbow_plot <- ElbowPlot(ft, reduction = 'log_norm_pca', ndims = 50)
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_elbow_plot_lognorm.png"), plot = elbow_plot, width = 8, height = 6, units = "in")
+
+
+ft <- RunUMAP(ft, reduction = "log_norm_pca",
+                          reduction.name = "umap_log_norm_uncorrected",
+                          n.neighbors = 30,
+                          min.dist = 0.01,
+                          spread = 0.3,
+                          dims = 1:30)
+
+umap_lognorm_uncorrected <- DimPlot(ft, reduction = "umap_log_norm_uncorrected", group.by = "patient_id") + ggplot2::theme_bw() + ggplot2::labs(title = "UMAP of log-normalized data (uncorrected)")
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_umap_log_norm_uncorrected.png"), plot = umap_lognorm_uncorrected, width = 8, height = 6, units = "in")
+
+
+```
+
+
+## Normalizing merged seurat objects with SCTranform method for individual slides
+
+Running SCTransform to each layer (slide) individually. 
+
+``` {r SCTransform}
+ft <- SCTransform(ft, assay = 'RNA', new.assay.name = 'sct_split')
+
+ft <- RunPCA(ft, assay = 'sct_split', reduction.name = 'sct_split_pca', npcs = 50)
+
+elbow_plot <- ElbowPlot(ft, reduction = 'sct_split_pca', ndims = 50)
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_elbow_plot_sct_split.png"), plot = elbow_plot, width = 8, height = 6, units = "in")
+
+ft <- RunUMAP(ft, reduction = "sct_split_pca",
+                          reduction.name = "umap_sct_split_uncorrected",
+                          n.neighbors = 30,
+                          min.dist = 0.01,
+                          spread = 0.3,
+                          dims = 1:40)
+
+umap_sct_uncorrected <- DimPlot(ft, reduction = "umap_sct_split_uncorrected", group.by = "patient_id") + ggplot2::theme_bw() + ggplot2::labs(title = "UMAP of SCTransform-normalized data (uncorrected)")
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_umap_split_sct_uncorrected.png"), plot = umap_sct_uncorrected, width = 8, height = 6, units = "in")
+
+
+```
+
+## Splitting umap clusters by slide
+
+I am doing this so I can see how cells are clustering by slide. 
+
+``` {r umap plotting}
+
+#Splitting umaps per slide to see if there is any specific cluster per slide. 
+DimPlot(ft, reduction = "umap_sct_split_uncorrected", group.by = "patient_id", split.by = "slidename")
+
+
+
+```
+
+##Integrating SCTransformed data with Harmony on split seurat object
+
+I am testing Harmony integration in SCTransformed data. 
+
+``` {r data integration}
+#Harmony integration
+
+ft <- IntegrateLayers(object = ft, method = HarmonyIntegration, orig.reduction = "sct_split_pca",
+    new.reduction = "sct_split_harmony", verbose = FALSE)
+
+ft <- RunUMAP(ft, reduction = "sct_split_harmony",
+                          reduction.name = "umap_sct_split_harmonized", 
+                         n.neighbors = 30,
+                          min.dist = 0.01,
+                          spread = 0.3,
+                          dims = 1:40)
+
+umap_sct_split_harmony <- DimPlot(ft, reduction = "umap_sct_split_harmonized", group.by = "patient_id") + ggplot2::theme_bw() + ggplot2::labs(title = "UMAP of SCT-normalized data (harmony integration)")
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_umap_sct_split_harmonized.png"), plot = umap_sct_split_harmony, width = 8, height = 6, units = "in")
+
+
+```
+
+
+## Normalizing data with SCTransform for combined layers (slides)
+
+Here I am applying a SCTransform normalization on all layers (slides) combined. 
+
+``` {r normalization with SCTransform}
+
+ft <- SCTransform(ft, assay = 'RNA', new.assay.name = 'SCT')
+
+
+vst_model_sct <- ft[["SCT"]]@SCTModel.list$model1
+gene_meta_sct <- vst_model_sct@feature.attributes
+
+
+
+# Create a plot to evaluate residual variance
+plot <- ggplot2::ggplot(gene_meta_sct, aes(x = log10(gmean), y = residual_variance)) +
+  ggplot2::geom_point(alpha = 0.5) +
+  ggplot2::labs(
+    x = "log10(Gene Mean Expression)",
+    y = "Residual Variance",
+    title = "SCTransform Residual Variance Plot"
+  ) + ggplot2::geom_hline(yintercept = 1, linetype = "solid", color = "red") +
+  ggplot2::theme_bw()
+
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_sctransform_residual_variance_plot.png"), plot = plot, width = 8, height = 6, units = "in")
+
+```
+
+## Plotting PCA and UMAP plots for SCTransform-normalized data on combined slides.
+
+``` {r pca and umap for sct normalization}
+ft <- Seurat::RunPCA(ft, assay = 'SCT', reduction.name = 'sct_pca', npcs = 50)
+
+elbow_plot <- ElbowPlot(ft, reduction = 'sct_pca', ndims = 50)
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_elbow_plot_sct.png"), plot = elbow_plot, width = 8, height = 6, units = "in")
+
+ft <- RunUMAP(ft, reduction = "sct_pca",
+                          reduction.name = "umap_sct_uncorrected",
+                          n.neighbors = 30,
+                          min.dist = 0.01,
+                          spread = 0.3,
+                          dims = 1:40)
+
+umap_sct_uncorrected <- DimPlot(ft, reduction = "umap_sct_uncorrected", group.by = "slidename") + ggplot2::theme_bw() + ggplot2::labs(title = "UMAP of SCTransform-normalized data (uncorrected)")
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_umap_sct_uncorrected.png"), plot = umap_sct_uncorrected, width = 8, height = 6, units = "in")
+```
+
+
+## Batch correction with Harmony on SCTransform-normalized data
+
+Applying batch correction per patient ID. For this project, this exercise may not be needed. 
+
+``` {r batch correction with harmony on sct normalization}
+
+#run harmony on sct normalized data for batch correction
+ft <- harmony::RunHarmony(ft, group.by.vars = "patient_id", reduction.use = "sct_pca", project.dim = FALSE)
+
+ft <- Seurat::RunUMAP(ft, reduction = "harmony",
+                          reduction.name = "umap_sct_harmonized_per_patient",
+                          n.neighbors = 30,
+                          min.dist = 0.01,
+                          spread = 0.3,
+                          dims = 1:40)
+
+umap_sct_corrected <- DimPlot(ft, reduction = "umap_sct_harmonized_per_patient", group.by = "patient_id") + ggplot2::theme_bw() + ggplot2::labs(title = "UMAP of SCTransform-normalized data (corrected by patient)")
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_umap_sct_harmonized_per_patient.png"), plot = umap_sct_corrected, width = 8, height = 6, units = "in")
+```
+
+
+## Normalizing data with scPearsonPCA on combined seurat objects
+
+Here, I am normalizing all layers combined with the scPearsonPCA package, which have proven 
+quite effective with CosMx data. 
+
+``` {r normalization with scPearsonPCA}
+ft <- JoinLayers(ft, assay = "RNA") #Joining layers for split seurat object. 
+
+DefaultAssay(ft) <- "RNA"
+tc <- Matrix::colSums(ft[["RNA"]]$counts) ## total counts per cell (across all genes)
+genefreq <- scPearsonPCA::gene_frequency(ft[["RNA"]]$counts) ## gene frequency (across all cells)
+sum(genefreq)==1 # TRUE
+
+ft <- FindVariableFeatures(ft, nfeatures = 900)
+hvgs <- VariableFeatures(ft)
+
+### Returns a Seurat-style DimReduc object with 
+### hvgs x pcs feature loadings
+### cells x pcs cell embeddings
+### gene-length vector of the mean pearson of residuals
+### gene-length vector of the standard deviation of pearson residuals
+pcaobj <- 
+scPearsonPCA::sparse_quasipoisson_pca_seurat(ft[["RNA"]]$counts[hvgs,]
+                               ,totalcounts = tc
+                               ,grate = genefreq[hvgs]
+                               ,scale.max = 10 ## PCs reflect clipping pearson residuals > 10 SDs above the mean pearson residual
+                               ,do.scale = TRUE ## PCs reflect as if pearson residuals for each gene were scaled to have standard deviation=1
+                               ,do.center = TRUE ## PCs reflect as if pearson residuals for each gene were centered to have mean=0
+                               ,npcs = 50)
+
+
+
+```
+
+## Calculating PCAs and UMAPs with scPearsonPCA-normalized data. 
+
+Addding PCA and UMAP reductions to the seurat object. 
+
+``` {r pca and umaps from scPearsonPCA}
+ft[["pearsonpca_joined"]] <- pcaobj$reduction.data
+ElbowPlot(ft, reduction = "pearsonpca_joined", ndims = 50)
+
+umapobj <- scPearsonPCA::make_umap(pcaobj)
+ft[["pearsonpca_joined"]] <- pcaobj$reduction.data
+ft[["pearsonumap_joined"]] <- umapobj$ump
+
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+umapplot <- DimPlot(ft, reduction = "pearsonumap_joined", group.by = "slidename") + 
+  ggplot2::theme_bw() + ggplot2::labs(title = "UMAP of scPearsonPCA-normalized data (uncorrected)")
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_umap_pearsonpca_uncorrected.png"), plot = umapplot, width = 8, height = 6, units = "in")
+
+split_umap <- DimPlot(ft, reduction = "pearsonumap_joined", group.by = "patient_id", split.by = "slidename")
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_umap_pearsonpca_uncorrected_sep.png"), plot = split_umap, width = 15, height = 5, units = "in")
+```
+
+
+## Clustering scPearsonPCA-normalized data
+
+I will identify populations with unsupervised leiden clustering. For the FT project, 
+I should see Stromal-Mesenchimal, Immune, and Tumor-Epithelial clusters. 
+
+``` {r leiden clustering}
+
+ft <- FindNeighbors(ft, reduction = "pearsonumap_joined", graph.name = "pearson_snn", k.param = 50, annoy.metric = "euclidean", dims = 1:2)
+
+ft <- FindClusters(ft, graph.name = "pearson_snn", cluster.name = "pearson_leiden",
+                                algorithm = 4, resolution = 0.1)  # Leiden = algorithm 4
+
+umap_leiden = DimPlot(ft, reduction = "pearsonumap_joined", group.by = "pearson_leiden", label = TRUE, repel = TRUE, split.by = "slidename")
+
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_pearsonumap_leiden.png"), plot = umap_leiden, width = 15, height = 5, units = "in")
+
+```
+
+## Finding top markers for each leiden cluster
+
+``` {r finding top markers}
+
+#Find top markers for each leiden cluster using the SCTransform-normalized data.
+ft_markers <- FindAllMarkers(ft, assay = "RNA", slot = "data", group.by = "pearson_leiden", 
+test.use = "wilcox", only.pos = TRUE,
+ min.pct = 0.1, logfc.threshold = 0.5)
+
+#Remove markers with p_val = 0
+ft_markers <- subset(ft_markers, ft_markers$p_val_adj != 0)
+
+#Get the top 10 markers for each leiden cluster based on avg_log2FC
+ft_topmarkers <- ft_markers %>%
+  group_by(cluster) %>%
+  slice_head(n = 5) %>%
+  ungroup() 
+
+dotplot <- DotPlot(ft, features = unique(ft_topmarkers$gene), group.by = "pearson_leiden") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 5)) +
+  labs(title = "Top Markers for Each Leiden Cluster") + 
+  RotatedAxis()
+
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_dotplot_top_markers.png"), plot = dotplot, width = 15, height = 8, units = "in")
+
+write.csv(ft_topmarkers, file = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_top_markers.csv"), row.names = FALSE)
+```
+
+## Exploring cell markers
+
+``` {r feature plots}
+
+stic_features <- c("KRT17", "COL1A1", "MK167", "TOP2A")
+tcell_features <- c("IL32", "CXCR4", "CD3E", "CD2", "CD8A", "CD4")
+
+feature_plot <- FeaturePlot(object = ft, 
+features = c(stic_features),
+assay = "RNA", 
+slot = "data", 
+reduction = "pearsonumap_joined", 
+max.cutoff = 10)
+
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_feature_plot_stic.png"), plot = feature_plot, width = 10, height = 10, units = "in")
+
+```
+
+
+## Performing batch correction on scPearsonPCA-normalized data
+
+In this step, I am evaluating the effect of batch-correction based on patient ID. 
+This step may not be appropriate for this project, given that I am trying to capture 
+differences between patients. 
+
+``` {r batch correction for scPearsonPCA}
+
+genefreq_batch <- 
+scPearsonPCA::gene_frequency(ft[["RNA"]]$counts, obs = data.table(ft@meta.data)[,.(global_cell_ID, slidename)]
+               ,cellid_colname = "global_cell_ID"
+               ,batch_variable = "slidename")
+
+Matrix::colSums(genefreq_batch)
+
+### Returns a Seurat-style DimReduc object with 
+### hvgs x pcs feature loadings
+### cells x pcs cell embeddings
+### gene-length vector of the mean pearson of residuals
+### gene-length vector of the standard deviation of pearson residuals
+pcaobj_batch <- 
+scPearsonPCA::sparse_quasipoisson_pca_seurat_batch(ft[["RNA"]]$counts[hvgs,]
+                                     ,totalcounts = tc
+                                     ,grate = genefreq_batch[hvgs,] ##
+                                     ,obs =data.table(ft@meta.data)[,.(global_cell_ID, slidename)] 
+                                     ,batch_variable = "slidename"
+                                     ,cellid_colname = "global_cell_ID"
+                                     ,scale.max = 10
+                                     ,do.scale = TRUE
+                                     ,do.center = TRUE
+                                     )
+
+umapobj_batch <- scPearsonPCA::make_umap(pcaobj_batch)
+ft[["pearsonpca_batch"]] <- pcaobj_batch$reduction.data
+ft[["pearsonumap_batch"]] <- umapobj_batch$ump
+
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+umapplot_batch <- scPearsonPCA::plot_umap(umapreduc = "pearsonumap_batch", clustercol = 'slidename', semuse = ft)
+umapplot_batch <- umapplot_batch + ggplot2::theme_bw() + ggplot2::labs(title = "UMAP of scPearsonPCA-normalized data (corrected by slide)")
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_umap_pearsonpca_corrected.png"), plot = umapplot_batch, width = 8, height = 6, units = "in")
+                              
+
+
+```
+
+## Saving seurat object for downstream analysis
+
+``` {r saving seurat object}
+
+saveRDS(ft, paste0("/scratch/users/jliboy/FT/JL01/prelim_data/", date,"_ft_processed.rds"))
+
+```
+
