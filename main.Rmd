@@ -1,444 +1,2754 @@
 ---
-title: "CosMx Spatial Transcriptomics — TA649"
+title: "CosMx Data Loading — readCosMx() Test — TA649"
 author: "F. Ake"
-date: "2026-05-30"
+date: "2026-07-02"
 output:
   html_document:
     toc: true
     toc_float: true
-    toc_depth: 3
-    code_folding: show
-editor_options: 
+editor_options:
   chunk_output_type: inline
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(
-  echo    = TRUE,
-  warning = FALSE,
-  message = FALSE,
-  fig.width  = 10,
-  fig.height = 7,
-  engine.path = list(bash = "/usr/bin/bash")
-)
-```
-
-------------------------------------------------------------------------
-
-## Ideas & Tasks to Develop
-
-> *Working notes from team meetings — not part of the analysis pipeline.*
-
-### Cell-Type Annotation
-
-- **Transfer learning from Nanostring liver reference** — use the publicly available Nanostring liver reference dataset to perform label transfer onto our data (e.g. via `Seurat::FindTransferAnchors` / `TransferData`, or `Azimuth`). This would provide an objective, reference-anchored cell-type call as a complement or sanity-check against unsupervised clustering.
-
-- **Manual annotation + CellMarker 2.0** — refine cluster labels manually by cross-referencing marker genes against [CellMarker 2.0](http://cellmarker.bioinf.seu.edu.cn/) and liver-specific literature. Key AIH-relevant populations to resolve: pericentral vs periportal hepatocytes, Kupffer cells, HSCs, plasma cell subtypes, cholangiocytes, and IFN-stressed hepatocytes.
-
-### Spatial Visualisation
-
-- **Cell segmentation plot function** — develop a `plotSegmentation(obj, col.by, ...)` function that reads polygon vertex coordinates stored in `obj@misc$polygons` (or directly from Seurat FOV spatial data) and renders filled cell outlines with `ggplot2` (`geom_polygon`), colouring each cell by any `@meta.data` column. Useful for spatially contextualising cluster assignments and QC flags. *Discuss feasibility and design with Karan before implementing.*
-
-------------------------------------------------------------------------
 
 ## 1. Libraries & Configuration
 
-Load all required packages, define analysis constants (data paths, QC thresholds), and configure parallel execution.
+Load required packages, source the custom helper library, and define input paths.
 
-```{r libraries, message=FALSE}
-library(Seurat)
-library(ggplot2)
-library(dplyr)
-library(future)
-library(future.apply)
-library(data.table)
-library(openxlsx)
-library(clustree)
-library(ggthemes)
-library(Polychrome)
-library(scales)
-library(colorspace)
-library(scPearsonPCA)
-library(ggrepel)
+```{r setup, include=FALSE, cache=T, message=FALSE, warning=FALSE}
 
-source("./src/custom_functions.R")
 
-# Paths & panel
+# Set global configs
+# ==================
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = TRUE,
+  cache   = TRUE,
+  fig.width = 7,
+  fig.height = 7,
+  autodep = TRUE,
+  cache.path = "/Users/fake/Projects/LiverCosMX/.cache/knitr/",
+  cache.extra = file.mtime("/Users/fake/Projects/LiverCosMX/R/custom_functions.R")
+)
 
-# Path on Sherlock
-COSMX_INPUTFILES_REPO        <- "/scratch/users/franzake/CosMx_Spatial_transcriptomics/data/flatFiles/"
-# Path on Box
-COXMX_INPUTFILES_REPO2      <- " .. "
-PANEL_FOV                    <- "Hs_6k"
-FOV_MAX_PROP_LOSS            <- 0.6
+# - Load custom functions
+# =======================
+source("/Users/fake/Projects/LiverCosMX/R/custom_functions.R")
+
+# - Load libraries
+# ================
+invisible(
+  lapply(
+    c("Seurat", "data.table", "ggplot2", "patchwork", "dplyr", 
+      "ggthemes", "Rmagic", "openxlsx", "celda", "scPearsonPCA", 
+      "HieraType", "anndata"), 
+    function(x) { library(x, quietly = T, character.only = T) } 
+  )
+)
+
+
+# - Define Paths
+# ==============
+COSMX_INPUTFILES_REPO <- "/Users/fake/Projects/LiverCosMX/data/flatFiles"
+TX_FILE       <- Sys.glob(file.path(COSMX_INPUTFILES_REPO, "*", "*_tx_file.csv.gz"))
+FOV_POSITIONS <- Sys.glob(file.path(COSMX_INPUTFILES_REPO, "*", "*_fov_positions_file.csv.gz"))
+TMA_XLSX      <- Sys.glob(file.path(COSMX_INPUTFILES_REPO, "*", "*.xlsx"))
+PANEL_FOV     <- "Hs_6k"
+
+```
+
+
+## 2. Read CosMx flat files into a Seurat object 
+
+```{r read_cosmx, cache=T}
+
+# - reading Seurat Object from AtomX flatfiles...
+usc <- readCosMx(experiment_repo = COSMX_INPUTFILES_REPO)
+
+# - Compute QC metrics within seurat object...
+usc <- computeFOVintegrity(usc, max_prop_loss = 0.6, panel_name = PANEL_FOV)
+usc <- computeSBR(usc)
+
+```
+
+## 3. Compute QC metrics
+
+```{r qc_metrics, cache=T, fig.height=10}
 
 # QC thresholds
-COUNTS_THRESHOLD_MIN          <- 30
-COUNTS_THRESHOLD_MAX          <- NULL
-AREA_THRESHOLD_MIN            <- NULL
-AREA_THRESHOLD_MAX            <- 80e3
-SBR_THRESHOLD_MIN             <- 0
-SBR_THRESHOLD_MAX             <- 7.5
-FOV_INTEGRITY_PERCENT_THRESHOLD <- 0.6
-SPLIT_RATIO_THRESHOLD_MIN     <- NULL
-SPLIT_RATIO_THRESHOLD_MAX     <- log2(4)
+# =============
+COUNTS_THRESHOLD_MIN      <- 60        
+COUNTS_THRESHOLD_MAX      <- 12000     
+FEATURE_THRESHOLD_MIN     <- 60      
+FEATURE_THRESHOLD_MAX     <- 4000
+AREA_THRESHOLD_MAX        <- 80e3      
+SBR_THRESHOLD_MIN         <- 0         
+SBR_THRESHOLD_MAX         <- 4.5
+SPLIT_RATIO_THRESHOLD_MIN <- log2(0.15) 
+SPLIT_RATIO_THRESHOLD_MAX <- log2(4)   
+EXTRANUCLEAR_THRESHOLD_MAX <- 98
 
-# Parallelise heavy steps (SCTransform, RCTD, etc.)
-plan("multicore", workers = 6)
-options(future.globals.maxSize = 60 * 1024^3)
-```
-
-------------------------------------------------------------------------
-
-## 2. Input Files
-
-Preview the flat-file directory tree to confirm all expected CosMx output files are present on my Sherlock repo.
-
-```{r list_files}
-system("/oak/stanford/groups/bhowitt/conda_envs/workspace/bin/eza -T -L 4 .")
-```
-
-------------------------------------------------------------------------
-
-## 3. Data Loading
-
-Read raw CosMx flat files into a Seurat object via `readCosMx()`. Tissue condensation runs automatically, and the TMA layout is visualised by FOV.
-
-```{r data_loading}
-usc <- readCosMx(experiment_repo = COSMX_INPUTFILES_REPO)
-usc
-```
-Let's visualize the TMA slide
-
-```{r plot_TMA1, fig.height=11}
-TmaPlot(usc, col.by = "FOV", dark = F)
-```
-
-------------------------------------------------------------------------
-
-## 4. Quality Control
-
-QC proceeds in three stages: (1) compute per-cell metrics, (2) inspect distributions and apply thresholds, and (3) map each FOV to its TMA core.
-
-### 4.1 QC Metrics
-
-Four metrics are used to filter low-quality cells:
-
-- **nCount vs nFeature RNA** — transcriptomic complexity; very low or high values flag empty segmentations, background, or merged cells.
-- **nCount vs Area** — segmentation consistency; unusually small or large cells reflect debris or merged-cell artefacts.
-- **SBR vs nCount** — signal-to-background ratio; low values indicate noisy or unreliable transcript detections.
-- **Split Ratio vs Area** — boundary fragmentation; high values indicate over-segmentation and poor transcript assignment.
-
-Let's calculate FOV, SBR & SplitRatioToLocal to Local scores... 
-
-```{r qc_controls_and_filtering}
-# Compute per-cell QC metrics
-usc <- computeFOVintegrity(usc, max_prop_loss = FOV_MAX_PROP_LOSS, panel_name = PANEL_FOV)
-usc <- computeSBR(usc)
-usc <- computeSplitRatio(usc)
-usc$SplitRatioToLocal_log2 <- log2(usc$SplitRatioToLocal)
-```
-
-Let's visualize the QC plots 
-Potentially can serve for adjusting the default QC parameters...
-
-```{r compute_canonicals_QC_plots}
-
-# Raw QC scatter plots with thresholds
-plots <- plotQCs(
+qc <- QCoverview(
   usc,
   count_min       = COUNTS_THRESHOLD_MIN,
   count_max       = COUNTS_THRESHOLD_MAX,
-  area_min        = AREA_THRESHOLD_MIN,
+  feature_min     = FEATURE_THRESHOLD_MIN,
+  feature_max     = FEATURE_THRESHOLD_MAX,
   area_max        = AREA_THRESHOLD_MAX,
-  sbr_min         = SBR_THRESHOLD_MIN,
-  sbr_max         = SBR_THRESHOLD_MAX,
-  split_ratio_min = SPLIT_RATIO_THRESHOLD_MIN,
-  split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX,
-  base_size = 15) %>%
-  patchwork::wrap_plots(nrow = 4)
+  sbr_min          = SBR_THRESHOLD_MIN,
+  sbr_max          = SBR_THRESHOLD_MAX,
+  split_ratio_min  = SPLIT_RATIO_THRESHOLD_MIN,
+  split_ratio_max  = SPLIT_RATIO_THRESHOLD_MAX,
+  base_size = 13
+)
+
+# plot QC panels
+# ==============
+qc = lapply(
+  qc, 
+  function(x) x + ggthemes::theme_clean(base_size = 5)
+) %>% 
+  patchwork::wrap_plots(qc, ncol = 2) ; qc
 
 ```
 
-Let's visualize the plots...
+## 5. TMA core assignment
 
-```{r viz_QCplots, fig.height=12}
-plots
-```
+The map is transposed to match the slide layout (`assignCoresToCells()` warns if the orientation
+still looks off).
 
-
-After adjustments of threshold values ... the filtering can be applied on the Seurat object
-using custom function QCfiltering...
-
-```{r compute_filtering}
-
-# Apply QC filtering
-usc_qc <- QCfiltering(
-  usc,
-  count_min               = COUNTS_THRESHOLD_MIN,
-  count_max               = COUNTS_THRESHOLD_MAX,
-  area_min                = AREA_THRESHOLD_MIN,
-  area_max                = AREA_THRESHOLD_MAX,
-  fov_integrity_threshold = FOV_INTEGRITY_PERCENT_THRESHOLD,
-  sbr_min                 = SBR_THRESHOLD_MIN,
-  sbr_max                 = SBR_THRESHOLD_MAX,
-  split_ratio_min         = SPLIT_RATIO_THRESHOLD_MIN,
-  split_ratio_max         = SPLIT_RATIO_THRESHOLD_MAX)
-
-```
-
-Computation and visualization of QC plots following filtering...
-
-```{r compute_QCplots2}
-
-# Post-filter QC scatter plots
-plots_qcs <- plotQCs(
-  usc_qc,
-  count_min       = COUNTS_THRESHOLD_MIN,
-  count_max       = COUNTS_THRESHOLD_MAX,
-  area_min        = AREA_THRESHOLD_MIN,
-  area_max        = AREA_THRESHOLD_MAX,
-  sbr_min         = SBR_THRESHOLD_MIN,
-  sbr_max         = SBR_THRESHOLD_MAX,
-  split_ratio_min = SPLIT_RATIO_THRESHOLD_MIN,
-  split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX,
-  base_size = 15) %>%
-  patchwork::wrap_plots(nrow = 4)
-```
-
-Visualization after filtering...
-
-```{r viz_QCplots2, fig.height=12}
-plots_qcs
-
-```
+```{r tma_assign, fig.height=6, cache=T}
 
 
-Summarization_with_upSet_plot
-
-```{r upset_plot_summarization}
-
-# UpSet plot — overlap of filtering flags
-usc_qc@misc$qc_plots$upset
-
-```
-
-
-### 4.2 FOV-to-Core Assignment
-
-Parse the TMA construction-key Excel file, map each FOV to its core grid position, then propagate core identities to individual cells. One FOV (182) requires a manual correction.
-
-```{r assignation_of_fov_to_cores}
-# Parse TMA map (transpose: rows = TMA rows, cols = TMA cols)
-tma_mat <- parseTMAmap("data/flatFiles/TA649/TA-649 Autoimmune Hepatitis biopsy.xlsx") %>% t()
+# Parse the construction key; transpose to match the slide's core grid
+# ====================================================================
+tma_mat <- t(parseTMAmap(TMA_XLSX))
 tma_mat[is.na(tma_mat)] <- "control"
 tma_mat
 
-# Assign FOVs to TMA cores
-usc_qc <- assignCoresToCells(usc_qc,
+usc <- assignCoresToCells(
+  usc,
   tma_map              = tma_mat,
-  fov_positions        = as.data.frame(fread("data/flatFiles/TA649/TA649_fov_positions_file.csv.gz")),
-  core_drift_tolerance = 0.40)
+  fov_positions        = as.data.frame(data.table::fread(FOV_POSITIONS)),
+  core_drift_tolerance = 0.4, 
+  min_cells            = 30
+)
 
-usc_qc@misc$fov_core_plots$TA649$Whole_Slide_by_Row
-usc_qc@misc$fov_core_plots$TA649$Whole_Slide_by_Column
+# Diagnostic maps to confirm the orientation (row / column sweeps)
+# ================================================================
+setPlotLabelSize(usc@misc$fov_core_plots[[1]]$Whole_Slide_by_Row, size = 1) +
+  ggthemes::theme_clean(base_size = 7)
 
-# Manual reassignment: FOV 182 was misassigned — correct to C2R3 / sample 37170
-usc_qc$core_str  <- (usc_qc@meta.data %>% dplyr::mutate(core_str  = ifelse(fov == 182, "C2R3",  core_str)))$core_str
-usc_qc$sample_id <- (usc_qc@meta.data %>% dplyr::mutate(sample_id = ifelse(fov == 182, "37170", sample_id)))$sample_id
+setPlotLabelSize(usc@misc$fov_core_plots[[1]]$Whole_Slide_by_Column, size = 1) +
+  ggthemes::theme_clean(base_size = 7)
 
-# Visualise sample assignments on TMA
-sample_cols <- c(
+# Correction
+# ==========
+sel <- usc$fov == 23
+usc$core_str[sel]  <- "C3R3"
+usc$sample_id[sel] <- "37171"
+
+
+```
+
+```{r tma_plot, cache=T, fig.height=10}
+
+# Visualize FOVs on the TMA using sample-specific colour families
+# ===============================================================
+base_sample_cols <- c(
   "#E41A1C", "#377EB8", "#4DAF4A", "#FF7F00",
   "#984EA3", "#A65628", "#F781BF", "#FFED6F",
   "#00CED1", "#8B0000", "#006400", "#FF6347",
-  "#4B0082", "#2E8B57"
+  "#4B0082", "#2E8B57", "orange"
 )
-TmaPlot(usc_qc, col.by = "sample_id", label = TRUE, cols = sample_cols, dark = TRUE)
+
+sample_levels <- sort(unique(as.character(usc$sample_id)))
+sample_cols <- setNames(base_sample_cols[seq_along(sample_levels)], sample_levels)
+
+make_sample_shades <- function(base_col, n) {
+  if (n == 1) return(base_col)
+  grDevices::colorRampPalette(c(
+    colorspace::darken(base_col, 0.20),
+    base_col,
+    colorspace::lighten(base_col, 0.35)
+  ))(n)
+}
+
+fov_palette_df <- usc@meta.data %>%
+  dplyr::distinct(sample_id, fov, FOV) %>%
+  dplyr::mutate(sample_id = as.character(sample_id)) %>%
+  dplyr::arrange(sample_id, fov) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::mutate(
+    fov_col = make_sample_shades(sample_cols[dplyr::first(sample_id)], dplyr::n())
+  ) %>%
+  dplyr::ungroup()
+
+fov_cols <- setNames(fov_palette_df$fov_col, fov_palette_df$FOV)
+
+# Plotting
+# ========
+TmaPlot(usc, col.by = 'sample_id', pt.size = 0.05, 
+        cols = base_sample_cols, label = T, label.size = 1) +
+  theme_clean(base_size=7)
+
 ```
 
-------------------------------------------------------------------------
+## 6. QC filtering
 
-## 5. Dimensionality Reduction
+Remove from the Seurat object cells that have been flagged following QC threshold defined earlier
 
-Four embedding strategies are compared to find the best representation for downstream clustering. Batch effects across samples are addressed progressively.
+```{r qc_filter, warning=F, cache=T}
 
-### 5.1 SCTransform — No Batch Correction
+usc2 <- QCfiltering(
+  usc,
+  count_min       = COUNTS_THRESHOLD_MIN,
+  count_max       = COUNTS_THRESHOLD_MAX,
+  feature_min     = FEATURE_THRESHOLD_MIN,  
+  feature_max     = FEATURE_THRESHOLD_MAX,
+  area_max        = AREA_THRESHOLD_MAX,
+  sbr_min         = SBR_THRESHOLD_MIN,
+  sbr_max         = SBR_THRESHOLD_MAX,
+  split_ratio_min = SPLIT_RATIO_THRESHOLD_MIN,
+  split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX,
+  filter          = TRUE,
+  upset_text_scale = 1.3
+)
 
-Baseline embedding using SCT normalisation, PCA, and UMAP. Exposes any sample-level batch structure.
+# plotting...
+usc2@misc$qc_plots$summary
+usc2@misc$qc_plots$upset
 
-```{r dimensionality_reduction_noBatch_correction}
-usc_qc <- FindVariableFeatures(usc_qc, nfeatures = 2000)
-
-usc_qc <- SCTransform(
-  usc_qc,
-  assay           = "RNA",
-  vars.to.regress = c("nCount_RNA", "nFeature_RNA"),
-  clip.range      = c(-10, 10))
-
-usc_qc <- RunPCA(usc_qc, npcs = 30, assay = "SCT")
-ElbowPlot(usc_qc, ndims = 50)
-NPCS <- 10
-
-usc_qc <- RunUMAP(usc_qc, dims = 1:NPCS, reduction = "pca")
-UMAP.plot0 <- DimPlot(usc_qc, group.by = "sample_id", label = TRUE, reduction = "umap") +
-  ggtitle("UMAP — SCT, no batch correction")
-UMAP.plot0
 ```
 
-A clear sample-level batch effect is visible in the UMAP.
 
-### 5.2 SCTransform + Harmony Batch Correction
+<!-- Let's perform a decontamination of ambientRNA with DecontX -->
 
-Harmony integration applied on the SCT PCA embedding to correct sample-level batch.
+<!-- ```{r ambientRNA_removal, cache=T} -->
 
-```{r DR_with_harmony_batch_correction}
-tmp_00 <- usc_qc[["pca"]]
-harmony_embedding1 <- harmony::RunHarmony(
-  usc_qc[["pca"]]@cell.embeddings,
-  meta_data = usc_qc@meta.data,
-  vars_use  = "sample_id")
-tmp_00@cell.embeddings  <- harmony_embedding1
-usc_qc[["pca_harmony"]] <- tmp_00
+<!-- # Run DecontX for detection of ambiantRNA contamination... -->
+<!-- dcx_usc2 = celda::decontX( -->
+<!--   x    = as(GetAssayData(usc2, assay = "RNA", layer = "counts"), "CsparseMatrix"), -->
+<!--   seed = 1 -->
+<!-- ) -->
+<!-- usc2$contamination <- dcx_usc2$contamination -->
 
-usc_qc[["umap_sct_harmony"]] <- (RunUMAP(usc_qc, reduction = "pca_harmony", dims = 1:NPCS))@reductions$umap
-UMAP.plot1 <- DimPlot(usc_qc, group.by = "sample_id", label = TRUE, reduction = "umap_sct_harmony", pt.size = 1.5) +
-  ggtitle("UMAP — SCT + Harmony batch correction")
-UMAP.plot1
+<!-- # Exclude cells with more than 60% of contamination detected with decontX from the object... -->
+<!-- usc2[['decontx']] = CreateAssay5Object(counts = dcx_usc2$decontXcounts) -->
+<!-- usc2 = subset(usc2, contamination < 0.6) -->
+
+<!-- ``` -->
+
+
+## 7. Dimensionality reduction with integration
+
+### a. No Ambient RNA Decontamination 
+
+Usage of scPearsonPCA tool for Dimensionality reduction analysis...
+
+```{r dimred, cache=T, fig.height=6}
+
+DefaultAssay(usc2) = "RNA"
+LABEL_NAME = "no_decont"
+
+# Usage of scPEarsonPCA for DimReduc
+# ==================================
+
+usc2 = runScPearsonDimRed(
+  usc2, 
+  nfeatures = 700,
+  batch_vars = c("sample_id", "fov"),
+  label = LABEL_NAME
+)
+
+#set default DimReduc
+DefaultDimReduc(usc2) = paste0(LABEL_NAME, "_umap")
+
+# 7. Plotting...
+p1 = DimPlot(
+  usc2, 
+  group.by = "sample_id",
+  label = F,
+  label.size = 4,
+  raster = T) +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction") +
+  theme(legend.position = "none")
+
+p2 = DimPlot(
+  usc2, 
+  group.by = "clusters",
+  label = T,
+  label.size = 4,
+  raster = T) +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction") +
+  theme(legend.position = "none")
+
+p1
+p2
+
 ```
 
-A residual "globe" artefact in the UMAP suggests SCT normalisation is sub-optimal for this dataset. The quasi-Poisson approach below addresses this.
+### b. Ambient RNA decontamination
 
-### 5.3 scPearsonPCA — Native Batch Integration
+Let's use DeSpotX for generation of a h5ad object
 
-Quasi-Poisson PCA with built-in per-batch gene-frequency correction. More statistically appropriate for count-based spatial data.
+#### - b.1 All cells in Liver
 
-```{r scPearson_approach_with_batch_integration}
-DefaultAssay(usc_qc) <- "RNA"
+Generation of h5ad file...
 
-tc <- Matrix::colSums(usc_qc[["RNA"]]$counts)
+```{r seurat_to_h5ad_for_despotx, cache=T}
 
-genefreq_batch <- gene_frequency(
-  usc_qc[["RNA"]]$counts,
-  obs            = data.table(usc_qc@meta.data)[, .(cell_ID, sample_id)],
-  cellid_colname = "cell_ID",
-  batch_variable = "sample_id")
+# Wrappers for generating anndata object
+# ======================================
+python_anndata <- reticulate::import("anndata", convert = FALSE)
+python_pandas <- reticulate::import("pandas", convert = FALSE)
 
-tmp_00 <- sparse_quasipoisson_pca_seurat_batch(
-  usc_qc[["RNA"]]$counts[hvgs, ],
-  totalcounts    = tc,
-  grate          = genefreq_batch[hvgs, ],
-  obs            = data.table(usc_qc@meta.data)[, .(cell_ID, sample_id)],
-  batch_variable = "sample_id",
-  cellid_colname = "cell_ID",
-  scale.max      = 10,
-  do.scale       = TRUE,
-  do.center      = TRUE)
-usc_qc[["pearson_pca_batch"]] <- tmp_00$reduction.data
+# despotx's Python env (anndata 0.10.9) can't read the "nullable-string-array"
+# encoding pandas>=3.0/anndata>=0.13 use by default for string dtypes; force
+# plain object-dtype strings so the h5ad stays readable there.
+python_pandas$set_option("future.infer_string", FALSE)
+make_anndata <- function(X, obs, var, obsm = NULL) {
+  obs_names <- rownames(X); if (is.null(obs_names)) obs_names <- rownames(obs)
+  var_names <- colnames(X); if (is.null(var_names)) var_names <- rownames(var)
+  if (is.data.frame(obs)) rownames(obs) <- obs_names
+  if (is.data.frame(var)) rownames(var) <- var_names
+  X <- anndata:::.check_matrix(X)   # same matrix-conversion helper the package itself uses
+  ad <- python_anndata$AnnData(X = X, obs = obs, var = var, obsm = obsm)  # no dtype arg
+  anndata::AnnDataR6$new(ad)         # wrap back into the normal R6 object ($write_h5ad(), $X, etc.)
+}
 
-tmp_01 <- scPearsonPCA::make_umap(tmp_00)
-usc_qc[["pearson_umap_batch"]]  <- tmp_01$ump
-usc_qc[["pearson_graph_batch"]] <- Seurat::as.Graph(tmp_01$grph)
+# Conversion of Seurat object into a h5ad object / file
+# =====================================================
+tc = counts_mat <- Matrix::t(usc2[["RNA"]]$counts)
 
-UMAP.plot2 <- DimPlot(usc_qc, reduction = "pearson_umap_batch", group.by = "sample_id", pt.size = 1.5) +
-  ggtitle("UMAP — scPearsonPCA, native batch integration")
-UMAP.plot2
+# 2. Cell metadata — the column DeSpotX will condition on via --cell-type-col.
+# sample_id/fov/cell_id are carried through so downstream reclustering
+# (runScPearsonDimRed's batch correction) can run on despotx's Sherlock side
+# without needing to re-derive them from the original Seurat object.
+obs_df <- data.frame(
+  cluster   = as.character(usc2$clusters),
+  cell_id   = as.character(usc2$cell_id),
+  sample_id = as.character(usc2$sample_id),
+  fov       = as.character(usc2$fov),
+  row.names = colnames(usc2)
+)
+
+# 3. Gene metadata — var_names only strictly required by DeSpotX.
+var_df <- data.frame(row.names = rownames(usc2[["RNA"]]))
+
+# 4. Spatial coordinates — must be EXACTLY 2D (x, y).
+coords <- GetTissueCoordinates(usc2, image = "TA649")
+coords <- coords[match(colnames(usc2), coords$cell), c("x", "y")]
+spatial_mat <- as.matrix(coords)
+
+# 5. Assemble....
+usc2.adata <- make_anndata(
+  X    = counts_mat,
+  obs  = obs_df,
+  var  = var_df,
+  obsm = list(spatial = spatial_mat)
+)
+
+# 6. Force CSR before writing — via the raw Python object, not the R6 $X<- setter
+py_ad <- usc2.adata$.get_py_object()
+sp <- reticulate::import("scipy.sparse", convert = FALSE)
+py_ad$X <- sp$csr_matrix(py_ad$X)
+
+# sanity check before writing
+cat("X format:", as.character(py_ad$X$format), "\n")   # should print "csr"
+cat("X shape:", paste(reticulate::py_to_r(py_ad$X$shape), collapse=" x "), "\n")
+
+# 7. Write directly from the raw python object (bypasses the R6 wrapper entirely).
+py_ad$write_h5ad("usc2.h5ad")
+
+
 ```
 
-### 5.4 scPearsonPCA + Harmony Batch Correction
+Run DespotX on Sherlock...
 
-Quasi-Poisson PCA followed by Harmony correction as an additional comparison.
+```{r run_despotx, cache=T, fig.height=6}
 
-```{r scPearson_approach_with_harmony_batch_on_pearson_pca}
-DefaultAssay(usc_qc) <- "RNA"
+# Ran DespotX on Sherloock for better performances...
+# ===================================================
+# /Users/fake/Library/Python/3.9/bin/despotx \
+#   --h5ad usc2.h5ad \
+#   --cell-type-col cluster \
+#   --spatial-key spatial \
+#   --out despotx_output \
+#   --device cuda
+  
+  
+  
+# Import adjusted h5ad object and convertion into Seurat object
+# =============================================================
+usc2.adjusted <- read_h5ad("despotx_output/adjusted.h5ad")
 
-tc       <- Matrix::colSums(usc_qc[["RNA"]]$counts)
-genefreq <- scPearsonPCA::gene_frequency(usc_qc[["RNA"]]$counts)
+# cells x genes (dgRMatrix) -> genes x cells (dgCMatrix), Seurat's expected orientation
+X <- as(usc2.adjusted$X, "CsparseMatrix")
+rownames(X) <- rownames(usc2.adjusted$obs)
+colnames(X) <- rownames(usc2.adjusted$var)
+counts <- Matrix::t(X)
 
-usc_qc <- Seurat::FindVariableFeatures(usc_qc, nfeatures = 2000)
-hvgs   <- VariableFeatures(usc_qc)
+# Integrate into Seurat object
+usc2[["despotx"]] = Seurat::CreateAssayObject(counts)
 
-tmp_02 <- sparse_quasipoisson_pca_seurat(
-  usc_qc[["RNA"]]$counts[hvgs, ],
+DefaultAssay(usc2) = "despotx"
+
+# Usage of scPEarsonPCA for DimReduc
+# ==================================
+
+tc = Matrix::colSums(usc2[["despotx"]]$counts)
+
+# create custom column regarding sample_id & fov as it seems that i observed batch effect related to both cases...
+usc2$sample_id_fov = paste0(usc2$sample_id, "-", usc2$fov)
+
+# compute gene frequency...
+genefreq_batch = scPearsonPCA::gene_frequency(
+  usc2[["despotx"]]$counts, 
+  obs = data.table(usc2@meta.data)[,.(cell_id, sample_id_fov)], 
+  cellid_colname = "cell_id", 
+  batch_variable = c("sample_id_fov")
+)
+
+usc2 = FindVariableFeatures(usc2, nfeatures = 2000)
+hvgs <- VariableFeatures(usc2, assay = "despotx")
+
+# compute PCA & Bacth integration...
+pcaobj_batch = sparse_quasipoisson_pca_seurat_batch(
+  usc2[["despotx"]]$counts[hvgs,],
   totalcounts = tc,
-  grate       = genefreq[hvgs],
-  scale.max   = 10,
-  do.scale    = TRUE,
-  do.center   = TRUE)
-
-harmony_embedding2 <- harmony::RunHarmony(
-  tmp_02$reduction.data@cell.embeddings,
-  meta_data = usc_qc@meta.data,
-  vars_use  = "sample_id")
-tmp_02$reduction.data@cell.embeddings <- harmony_embedding2
-
-tmp_03 <- scPearsonPCA::make_umap(tmp_02)
-usc_qc[["pearson_pca_harmony"]] <- tmp_02$reduction.data
-
-usc_qc[["pearson_umap_sct_harmony"]] <- (RunUMAP(usc_qc, reduction = "pearson_pca_harmony", dims = 1:13))@reductions$umap
-UMAP.plot3 <- DimPlot(usc_qc, group.by = "sample_id", label = TRUE, reduction = "pearson_umap_sct_harmony", pt.size = 1.5) +
-  theme(legend.position = "none") +
-  ggtitle("UMAP — scPearsonPCA + Harmony batch correction")
-UMAP.plot3
-```
-
-#### QC Overlay on Embedding
-
-Inspect whether low-quality cells cluster together in the chosen embedding.
-
-```{r more_on_QC}
-lapply(c("nCount_RNA", "nFeature_RNA"), function(x) {
-  FeaturePlot(usc_qc, feature = x, order = TRUE, raster = FALSE, assay = "SCT") + ggthemes::theme_clean()
-}) %>% patchwork::wrap_plots(nrow = 2)
-```
-
-------------------------------------------------------------------------
-
-## 6. Clustering & Cell-Type Annotation
-
-### 6.1 Marker Discovery
-
-Find top differentially expressed markers per cluster, then inspect cluster-level average expression with a heatmap.
-
-```{r marker_discovery}
-Idents(usc_qc) <- usc_qc$seurat_clusters
-usc.markers <- data.table(FindAllMarkers(usc_qc, assay = "SCT", only.pos = TRUE))
-usc.markers
-
-top5.markers <- (usc.markers %>% group_by(cluster) %>% slice_head(n = 30)) %>% data.table()
-
-avg.mat <- data.frame(AverageExpression(
-  usc_qc[top5.markers$gene, ],
-  group.by = "seurat_clusters",
-  layer    = "counts")[["SCT"]])
-pheatmap::pheatmap(avg.mat, scale = "row", display_numbers = TRUE)
-```
-
-### 6.2 Cell-Type Annotation
-
-Project known liver cell-type marker panels onto the UMAP to guide cluster labelling.
-
-```{r feature_plots_cell_types}
-jci_insight_markers <- list(
-  "Kupffer_cells/Macrophages"     = c("C1QC", "C1QB", "C1QA", "MARCO"),
-  "Hepatocytes"                   = c("SLC27A5", "ADH4", "SLC2A2", "ARG1", "CYP4A11"),
-  "HSCs"                          = c("COL1A1", "COL3A1", "DCN", "TAGLN", "SPARC"),
-  "Periportal_hepatocytes"        = c("SAA1", "CRP", "FBP1", "ASS1", "PCK1"),
-  "Epithelial_cells"              = c("KRT18", "PTK2", "SIGMAR1", "VPS29", "MED15"),
-  "Stressed_midzonal_hepatocytes" = c("HAMP", "FOS", "JUND", "SERPINE1", "CXCL2"),
-  "Plasma_cells_1"                = c("IGKC", "IGHG1/2", "JCHAIN", "MZB1", "IGHA1"),
-  "IFN_stressed_hepatocytes"      = c("CXCL9", "CXCL10", "STAT1", "HLA-G", "HLA-F"),
-  "Plasma_cells_2"                = c("IGLC1/2", "IGLL5", "IGKC", "IGHG1/2", "JCHAIN"),
-  "Pericentral_hepatocytes"       = c("GLUL", "TDO2", "FKBP5", "MGST1", "HSD11B1"),
-  "Cholangiocytes"                = c("KRT7", "KRT8", "TACSTD2", "MMP7", "SPP1")
+  grate = genefreq_batch[hvgs,],
+  obs =data.table(usc2@meta.data)[,.(cell_id, sample_id_fov)],
+  batch_variable = "sample_id_fov",
+  cellid_colname = "cell_id",
+  scale.max = 10,
+  do.scale = TRUE,
+  do.center = TRUE,
+  ncores = 8
 )
 
-plots <- lapply(names(jci_insight_markers)[1:2], function(x) {
-  message(x)
-  p <- FeaturePlot(usc_qc, features = jci_insight_markers[[x]], order = TRUE, raster = FALSE, combine = FALSE)
-  p <- lapply(p, function(x) x + theme(legend.position = "none"))
-  patchwork::wrap_plots(p, nrow = 1)
+# perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc2[["pca_despotx"]] <- pcaobj_batch$reduction.data
+usc2[["umap_despotx"]] <- umapobj$ump  
+usc2[["graph_despotx"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc2 <- Seurat::FindClusters(
+  usc2, 
+  resolution = 1, 
+  graph = "graph_despotx",
+  algorithm = 4
+)
+usc2@meta.data$clusters_despotx <- factor(paste0("G", usc2@meta.data$graph_despotx_res.1))
+
+
+p1.allcells_despot = DimPlot(
+  usc2, 
+  group.by = "sample_id",
+  label = F,
+  label.size = 4,
+  reduction = "umap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction - DespotX") +
+  theme(legend.position = "none")
+
+p2.allcells_despot = DimPlot(
+  usc2, 
+  group.by = "clusters_despotx",
+  label = T,
+  label.size = 4,
+  reduction = "umap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction - DespotX") +
+  theme(legend.position = "none")
+
+
+# Find Markers...
+Idents(usc2) = usc2$clusters_despotx
+
+usc2 <- NormalizeData(
+  usc2,
+  assay = "despotx",
+  normalization.method = "RC",
+  verbose = T
+)
+
+# Find markers using Seurat FindAllMarkers function...
+markers.despotx <- FindAllMarkers(
+  usc2,
+  assay           = "despotx",
+  only.pos        = FALSE,
+  min.pct         = 0.05,
+  logfc.threshold = 0.1,
+  test.use        = "wilcox"
+)
+fwrite(markers.despotx, file="all.markers.despotx.tsv", sep="\t")
+
+# Find markers using Hieratype ...
+markers.despotx.htp = HieraType::clusterwise_foldchange_metrics(
+  usc2[["despotx"]]$counts[hvgs,],
+  totalcounts = Matrix::colSums(usc2[["despotx"]]$counts),
+  metadata = usc2@meta.data, 
+  cluster_column = "clusters_despotx")
+fwrite(markers.despotx.htp, file="all.markers.despotx.htp.tsv", sep="\t")
+
+
+# Annotation...
+# =============
+usc2$celltype_despotx <- dplyr::case_when(
+  usc2$clusters_despotx == "G1"  ~ "T/NK.cells",
+  usc2$clusters_despotx == "G2"  ~ "Macrophages",
+
+  usc2$clusters_despotx == "G3"  ~ "Hep.Zone1",
+  usc2$clusters_despotx == "G4"  ~ "Hep.Zone3",
+  usc2$clusters_despotx == "G5"  ~ "Hep.Zone1.2",
+  usc2$clusters_despotx == "G8"  ~ "Hep.IFNg",
+
+  usc2$clusters_despotx == "G6"  ~ "Fibroblasts.1/Activated",
+  usc2$clusters_despotx == "G7"  ~ "Fibroblasts.2/Quiescent",
+
+  usc2$clusters_despotx == "G9"  ~ "Endothelials (LSEC)",
+  usc2$clusters_despotx == "G10" ~ "Cholangiocytes",
+  usc2$clusters_despotx == "G11" ~ "Proliferating",
+
+  usc2$clusters_despotx == "G12" ~ "Plasma.cells.1",
+  usc2$clusters_despotx == "G13" ~ "Plasma.cells.2",
+
+  usc2$clusters_despotx == "G14" ~ "Monocytes.Neutrophils",
+
+  TRUE ~ "Undefined"
+)
+
+celltype_colors_despotx <- c(
+  "Hep.Zone3"           = "#08306B",
+  "Hep.Zone1"           = "#2171B5",
+  "Hep.Zone1.2" = "#4292C6",
+  "Hep.IFNg"   = "#6BAED6",
+
+  "Macrophages" = "#E6550D",
+
+  "Fibroblasts.1/Activated" = "#6A3D9A",
+  "Fibroblasts.2/Quiescent" = "#A27AC3",
+
+  "Endothelials (LSEC)"          = "#00A087",
+  "Cholangiocytes"        = "#D8A600",
+  "Proliferating"         = "#525252",
+  "T/NK.cells"            = "#33A02C",
+  "Plasma.cells.1"        = "#C51B7D",
+  "Plasma.cells.2"        = "#DE77AE",
+  "Monocytes.Neutrophils" = "#CB181D",
+
+  "Undefined" = "#BDBDBD"
+)
+
+# Plotting...
+# ===========
+
+p3.allcells_despot = DimPlot(
+  usc2, 
+  group.by = "celltype_despotx",
+  label = T,
+  label.size = 3,
+  repel = T,
+  reduction = "umap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction - DespotX") +
+  theme(legend.position = "none")
+
+
+p1.allcells_despot
+p2.allcells_despot
+p3.allcells_despot
+
+```
+
+```{r heatmap_of_markers, cache=T, fig.width=13}
+
+# Heatmap
+# =======
+
+markers.despotx.htp = HieraType::clusterwise_foldchange_metrics(
+  usc2[["despotx"]]$counts[hvgs,],
+  totalcounts = Matrix::colSums(usc2[["despotx"]]$counts),
+  metadata = usc2@meta.data, 
+  cluster_column = "celltype_despotx")
+
+evidence_genes <- list(
+  "Hepatocytes.Zone3"           = c("CYP2E1", "GLUL", "ADH6", "SCD", "MGST1"),
+  "Hepatocytes.Zone1"           = c("HAMP", "ASS1", "PCK1", "SDS", "HP"),
+  "Hepatocytes.LipidMetabolism" = c("MLXIPL", "PPARA", "PLIN5", "ACSM2A", "GPAM"),
+  "Hepatocytes.IFNg.Stressed"   = c("CXCL9", "CXCL10", "GBP1", "STAT1", "MT2A"),
+
+  "Macrophages"   = c("MARCO", "CD5L", "VSIG4", "C1QB", "CD163"),
+
+  "Fibroblasts.1" = c("COL1A1", "COL3A1", "ACTA2", "TAGLN", "TIMP1"),
+  "Fibroblasts.2" = c("RELN", "RGS5", "CXCL14", "ECM1", "MASP1"),
+
+  "Endothelials"   = c("STAB1", "KDR", "RAMP3", "CD36", "ENG"),
+  "Cholangiocytes" = c("KRT7", "KRT19", "CDH1", "TACSTD2", "AQP1"),
+  "Proliferating"  = c("TOP2A", "CDK1", "CCNB1", "PCNA", "STMN1"),
+
+  "T/NK.cells" = c("CD27", "GNLY", "IFNG", "CCL5", "CCL3","GZMA","CD8A","CD8B","CD4"),
+
+  "Plasma.cells.1" = c("IGKC", "IGKV4-1", "JCHAIN", "MZB1", "IGHG1/2"),
+  "Plasma.cells.2" = c("IGLC1/2", "IGLL5", "IGLL1", "JCHAIN", "MZB1"),
+
+  "Monocytes.Neutrophils" = c("S100A8", "S100A9", "FCN1", "LYZ", "SRGN")
+)
+
+hm_rna <- add_ncells(
+  marker_heatmap(
+    markers.despotx.htp %>% filter(gene %in% unique(unlist(evidence_genes))), fold_change_min = 0.05
+  )
+) + 
+  labs(title = "Evidence Markers for cell types in CosmX Liver data")
+
+
+# Plotting...
+# ===========
+hm_rna
+
+```
+
+Let's focus on specific cell types...
+
+#### - b.2 Macrophages
+
+```{r subset_macrophages, cache=T}
+
+# subset Macrophages
+usc2.macrophages = subset(usc2, celltype_despotx %in% c("Macrophages"))
+
+
+#==============================================================================================
+#==============================================================================================
+
+# Perform Dimensionality reduction on subsetted Macrophages & Neutrophiles
+# ========================================================================
+
+DefaultAssay(usc2.macrophages) = "despotx"
+
+tc = Matrix::colSums(usc2.macrophages[["despotx"]]$counts)
+
+# 1. Create custom column regarding sample_id & fov as it seems that i observed batch effect related to both cases...
+usc2.macrophages$sample_id_fov = paste0(usc2.macrophages$sample_id, "-", usc2.macrophages$fov)
+
+# 2. Compute gene frequency...
+genefreq_batch = scPearsonPCA::gene_frequency(
+  usc2.macrophages[["despotx"]]$counts, 
+  obs = data.table(usc2.macrophages@meta.data)[,.(cell_id, sample_id_fov)], 
+  cellid_colname = "cell_id", 
+  batch_variable = c("sample_id_fov")
+)
+usc2.macrophages = FindVariableFeatures(usc2.macrophages, nfeatures = 2000)
+hvgs <- VariableFeatures(usc2.macrophages, assay = "despotx")
+
+# 3. compute PCA & Bacth integration...
+pcaobj_batch = sparse_quasipoisson_pca_seurat_batch(
+  usc2.macrophages[["despotx"]]$counts[hvgs,],
+  totalcounts = tc,
+  grate = genefreq_batch[hvgs,],
+  obs =data.table(usc2.macrophages@meta.data)[,.(cell_id, sample_id_fov)],
+  batch_variable = "sample_id_fov",
+  cellid_colname = "cell_id",
+  scale.max = 10,
+  do.scale = TRUE,
+  do.center = TRUE,
+  ncores = 8
+)
+
+# perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc2.macrophages[["pca_despotx2"]] <- pcaobj_batch$reduction.data
+usc2.macrophages[["umap_despotx2"]] <- umapobj$ump  
+usc2.macrophages[["graph_despotx2"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc2.macrophages <- Seurat::FindClusters(
+  usc2.macrophages, 
+  resolution = 1.5, 
+  graph = "graph_despotx2",
+  algorithm = 4
+)
+usc2.macrophages@meta.data$clusters <- factor(paste0(
+  "G",
+  usc2.macrophages@meta.data$graph_despotx2_res.1.5
+))
+
+p1.macrophages = DimPlot(
+  usc2.macrophages, 
+  group.by = "celltype_despotx",
+  label = T,
+  label.size = 4,
+  repel = T,
+  raster = T,
+  reduction = "umap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction - DespotX") +
+  theme(legend.position = "none") 
+
+p2.macrophages = DimPlot(
+  usc2.macrophages, 
+  group.by = "clusters",
+  label = T,
+  label.size = 4,
+  repel = T,
+  raster = T,
+  reduction = "umap_despotx2") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction - DespotX") +
+  theme(legend.position = "none")
+
+
+#==============================================================================================
+#==============================================================================================
+
+# DecontX decontamination assay
+# =============================
+
+dcx <- celda::decontX(
+  x    = as(GetAssayData(usc2.macrophages, assay = "despotx", layer = "counts"), "CsparseMatrix"),
+  z    = as.character(usc2.macrophages$clusters),
+  seed = 1
+)
+usc2.macrophages$contamination <- dcx$contamination
+usc2.macrophages[["decontx"]] <- CreateAssay5Object(counts = dcx$decontXcounts)
+
+
+#==============================================================================================
+#==============================================================================================
+
+
+# Conversion of Seurat object into a h5ad object / file
+# =====================================================
+tc = counts_mat <- Matrix::t(usc2.macrophages[["RNA"]]$counts)
+
+# 2. Cell metadata — the column DeSpotX will condition on via --cell-type-col.
+obs_df <- data.frame(
+  cluster = as.character(usc2.macrophages$clusters),
+  row.names = colnames(usc2.macrophages)
+)
+
+# 3. Gene metadata — var_names only strictly required by DeSpotX.
+var_df <- data.frame(row.names = rownames(usc2.macrophages[["RNA"]]))
+
+# 4. Spatial coordinates — must be EXACTLY 2D (x, y).
+coords <- GetTissueCoordinates(usc2.macrophages, image = "TA649")
+coords <- coords[match(colnames(usc2.macrophages), coords$cell), c("x", "y")]
+spatial_mat <- as.matrix(coords)
+
+# 5. Assemble....
+usc2.macrophages.adata <- make_anndata(
+  X    = counts_mat,
+  obs  = obs_df,
+  var  = var_df,
+  obsm = list(spatial = spatial_mat)
+)
+
+# 6. Force CSR before writing — via the raw Python object, not the R6 $X<- setter
+py_ad <- usc2.macrophages.adata$.get_py_object()
+sp <- reticulate::import("scipy.sparse", convert = FALSE)
+py_ad$X <- sp$csr_matrix(py_ad$X)
+
+# sanity check before writing
+cat("X format:", as.character(py_ad$X$format), "\n")   # should print "csr"
+cat("X shape:", paste(reticulate::py_to_r(py_ad$X$shape), collapse=" x "), "\n")
+
+# 7. Write directly from the raw python object (bypasses the R6 wrapper entirely).
+py_ad$write_h5ad("usc2.macrophages.h5ad")
+
+
+# 8. Import adjusted h5ad object and convertion into Seurat object
+# =============================================================
+usc2.macrophages.adjusted <- read_h5ad("despotx_output/macrophages/adjusted.h5ad")
+
+# cells x genes (dgRMatrix) -> genes x cells (dgCMatrix), Seurat's expected orientation
+X <- as(usc2.macrophages.adjusted$X, "CsparseMatrix")
+rownames(X) <- rownames(usc2.macrophages.adjusted$obs)
+colnames(X) <- rownames(usc2.macrophages.adjusted$var)
+counts <- Matrix::t(X)
+
+# Integrate into Seurat object
+usc2.macrophages[["despotx"]] = Seurat::CreateAssayObject(counts)
+
+
+#==============================================================================================
+#==============================================================================================
+
+# scPearson DimReduc on decontaminated object
+DefaultAssay(usc2.macrophages) = "decontx"
+
+
+# Usage of scPEarsonPCA for DimReduc
+# ==================================
+
+tc = Matrix::colSums(usc2.macrophages[["decontx"]]$counts)
+
+# create custom column regarding sample_id & fov as it seems that i observed batch effect related to both cases...
+usc2.macrophages$sample_id_fov = paste0(usc2.macrophages$sample_id, "-", usc2.macrophages$fov)
+
+# compute gene frequency...
+genefreq_batch = scPearsonPCA::gene_frequency(
+  usc2.macrophages[["decontx"]]$counts, 
+  obs = data.table(usc2.macrophages@meta.data)[,.(cell_id, sample_id_fov)], 
+  cellid_colname = "cell_id", 
+  batch_variable = c("sample_id_fov")
+)
+
+usc2.macrophages = FindVariableFeatures(usc2.macrophages, nfeatures = 2000)
+hvgs <- VariableFeatures(usc2.macrophages, assay = "decontx")
+
+# compute PCA & Bacth integration...
+pcaobj_batch = sparse_quasipoisson_pca_seurat_batch(
+  usc2.macrophages[["decontx"]]$counts[hvgs,],
+  totalcounts = tc,
+  grate = genefreq_batch[hvgs,],
+  obs =data.table(usc2.macrophages@meta.data)[,.(cell_id, sample_id_fov)],
+  batch_variable = "sample_id_fov",
+  cellid_colname = "cell_id",
+  scale.max = 10,
+  do.scale = TRUE,
+  do.center = TRUE,
+  ncores = 8
+)
+
+# perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc2.macrophages[["pca_decontx"]] <- pcaobj_batch$reduction.data
+usc2.macrophages[["umap_decontx"]] <- umapobj$ump  
+usc2.macrophages[["graph_decontx"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc2.macrophages <- Seurat::FindClusters(
+  usc2.macrophages, 
+  resolution = 1, 
+  graph = "graph_decontx",
+  algorithm = 4
+)
+usc2.macrophages@meta.data$clusters_decontx <- factor(paste0(
+  "G",
+  usc2.macrophages@meta.data$graph_decontx_res.1
+))
+
+
+# Find Markers...
+Idents(usc2.macrophages) = usc2.macrophages$clusters_despotx
+
+p3.macrophages = DimPlot(
+  usc2.macrophages, 
+  group.by = "clusters_decontx",
+  label = T,
+  raster = T,
+  label.size = 4,
+  reduction = "umap_decontx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction - DespotX") +
+  theme(legend.position = "none")
+
+
+p1.macrophages
+p2.macrophages
+p3.macrophages
+
+```
+
+
+```{r macrophages_decontX}
+
+# Perform DecontX
+# ===============
+counts_rna <- GetAssayData(usc2.macrophages, assay = "RNA", layer = "counts")
+dcx <- celda::decontX(
+  x    = as(counts_rna, "CsparseMatrix"),
+  z    = as.character(usc2.macrophages$clusters_despotx),
+  seed = 1
+)
+usc2.macrophages$decontX_contamination <- dcx$contamination
+usc2.macrophages[["decontX"]] <- CreateAssay5Object(counts = dcx$decontXcounts)
+
+
+# scPearson DimReduc on decontaminated object
+DefaultAssay(usc2.macrophages) = "decontX"
+
+
+# Usage of scPEarsonPCA for DimReduc
+# ==================================
+tc = Matrix::colSums(usc2.macrophages[["decontX"]]$counts)
+
+# create custom column regarding sample_id & fov as it seems that i observed batch effect related to both cases...
+usc2.macrophages$sample_id_fov = paste0(usc2.macrophages$sample_id, "-", usc2.macrophages$fov)
+
+# compute gene frequency...
+genefreq_batch = scPearsonPCA::gene_frequency(
+  usc2.macrophages[["decontX"]]$counts, 
+  obs = data.table(usc2.macrophages@meta.data)[,.(cell_id, sample_id_fov)], 
+  cellid_colname = "cell_id", 
+  batch_variable = c("sample_id_fov")
+)
+
+usc2.macrophages = FindVariableFeatures(usc2.macrophages, nfeatures = 6215)
+hvgs <- VariableFeatures(usc2.macrophages, assay = "decontX")
+
+# compute PCA & Bacth integration...
+pcaobj_batch = sparse_quasipoisson_pca_seurat_batch(
+  usc2.macrophages[["decontX"]]$counts[hvgs,],
+  totalcounts = tc,
+  grate = genefreq_batch[hvgs,],
+  obs =data.table(usc2.macrophages@meta.data)[,.(cell_id, sample_id_fov)],
+  batch_variable = "sample_id_fov",
+  cellid_colname = "cell_id",
+  scale.max = 10,
+  do.scale = TRUE,
+  do.center = TRUE,
+  ncores = 8
+)
+
+# perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc2.macrophages[["pearsonpca_decontx"]] <- pcaobj_batch$reduction.data
+usc2.macrophages[["pearsonumap_decontx"]] <- umapobj$ump  
+usc2.macrophages[["pearsongraph_decontx"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc2.macrophages <- Seurat::FindClusters(
+  usc2.macrophages, 
+  resolution = 1, 
+  graph = "pearsongraph_decontx",
+  algorithm = 4
+)
+usc2.macrophages@meta.data$clusters_decontx <- factor(paste0(
+  "G",
+  usc2.macrophages@meta.data$pearsongraph_decontx_res.1
+))
+
+
+Idents(usc2.macrophages) = usc2.macrophages$clusters_decontx
+usc2.macrophages <- NormalizeData(
+  usc2.macrophages,
+  assay = "RNA",
+  normalization.method = "RC",
+  verbose = T
+)
+
+# Find markers using Seurat FindAllMarkers function...
+markers.despotx <- FindAllMarkers(
+  usc2.macrophages,
+  assay           = "RNA",
+  only.pos        = FALSE,
+  min.pct         = 0.05,
+  logfc.threshold = 0.1,
+  test.use        = "wilcox"
+)
+fwrite(markers.despotx, file="all.markers.macrophages.decontx.tsv", sep="\t")
+
+# Find markers using Hieratype ...
+markers.despotx.htp = HieraType::clusterwise_foldchange_metrics(
+  usc2.macrophages[["decontX"]]$counts[hvgs,],
+  totalcounts = Matrix::colSums(usc2.macrophages[["decontX"]]$counts),
+  metadata = usc2.macrophages@meta.data, 
+  cluster_column = "clusters_decontx")
+fwrite(markers.despotx.htp, file="all.markers.macrophages.decontx.htp.tsv", sep="\t")
+
+
+# Annotation...
+# =============
+usc2.macrophages$celltype_macro <- dplyr::case_when(
+  usc2.macrophages$clusters_decontx == "G3" ~ "Macrophages",
+  usc2.macrophages$clusters_decontx == "G7" ~ "Dendritic.cells",
+  usc2.macrophages$clusters_decontx == "G5" ~ "Neutrophils.Monocytes",
+
+  usc2.macrophages$clusters_decontx == "G2" ~ "Contaminant.1",  # hepatocyte
+  usc2.macrophages$clusters_decontx == "G6" ~ "Contaminant.2",  # fibroblast
+  usc2.macrophages$clusters_decontx == "G8" ~ "Contaminant.3",  # plasma cells
+
+  usc2.macrophages$clusters_decontx == "G1" ~ "Undefined.1",
+  usc2.macrophages$clusters_decontx == "G4" ~ "Undefined.2",
+
+  TRUE ~ "Undefined"
+)
+
+celltype_colors_macro <- c(
+  "Macrophages"           = "#E6550D",
+  "Dendritic.cells"       = "#31A354",
+  "Neutrophils.Monocytes" = "#CB181D",
+
+  "Contaminant.1" = "#D9D9D9",
+  "Contaminant.2" = "#BDBDBD",
+  "Contaminant.3" = "#A3A3A3",
+
+  "Undefined.1" = "#404040",
+  "Undefined.2" = "#2A2A2A",
+  "Undefined"   = "#000000"
+)
+
+
+# Plotting...
+# ===========
+
+DimPlot(
+  usc2.macrophages, 
+  group.by = "clusters_decontx",
+  label = T,
+  label.size = 4,
+  reduction = "pearsonumap_decontx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction - DecontX") +
+  theme(legend.position = "none")
+
+ DimPlot(
+  usc2.macrophages, 
+  group.by = "celltype_macro",
+  label = T,
+  label.size = 4,
+  cols = celltype_colors_macro,
+  repel = T,
+  reduction = "pearsonumap_decontx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction - DespotX") +
+  theme(legend.position = "none")
+ 
+FeaturePlot(
+  subset(usc2.macrophages, decontX_contamination < 0.7),
+  order = T,
+  label = T,
+  raster = F,
+  reduction = "pearsonumap_decontx",
+  features = c("decontX_contamination"),
+  assay = "decontX"
+)
+
+
+```
+
+#### - b.2 T/NK.cells
+
+```{r subset_Tcells, cache=T}
+
+# subset Tcells
+usc2.tcells = subset(usc2, celltype_despotx %in% c("T/NK.cells"))
+
+# Perform Dimensionality reduction
+# ================================
+
+DefaultAssay(usc2.tcells) = "despotx"
+
+# Usage of scPEarsonPCA for DimReduc
+# ==================================
+
+tc = Matrix::colSums(usc2.tcells[["despotx"]]$counts)
+
+# create custom column regarding sample_id & fov as it seems that i observed batch effect related to both cases...
+usc2.tcells$sample_id_fov = paste0(usc2.tcells$sample_id, "-", usc2.tcells$fov)
+
+# compute gene frequency...
+genefreq_batch = scPearsonPCA::gene_frequency(
+  usc2.tcells[["despotx"]]$counts, 
+  obs = data.table(usc2.tcells@meta.data)[,.(cell_id, sample_id_fov)], 
+  cellid_colname = "cell_id", 
+  batch_variable = c("sample_id_fov")
+)
+
+usc2.tcells = FindVariableFeatures(usc2.tcells, nfeatures = 500)
+hvgs <- VariableFeatures(usc2.tcells, assay = "despotx")
+
+# compute PCA & Bacth integration...
+pcaobj_batch = sparse_quasipoisson_pca_seurat_batch(
+  usc2.tcells[["despotx"]]$counts[hvgs,],
+  totalcounts = tc,
+  grate = genefreq_batch[hvgs,],
+  obs =data.table(usc2.tcells@meta.data)[,.(cell_id, sample_id_fov)],
+  batch_variable = "sample_id_fov",
+  cellid_colname = "cell_id",
+  scale.max = 10,
+  do.scale = TRUE,
+  do.center = TRUE,
+  ncores = 8
+)
+
+# perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc2.tcells[["pearsonpca"]] <- pcaobj_batch$reduction.data
+usc2.tcells[["pearsonumap"]] <- umapobj$ump  
+usc2.tcells[["pearsongraph"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc2.tcells <- Seurat::FindClusters(
+  usc2.tcells, 
+  resolution = 1, 
+  graph = "pearsongraph",
+  algorithm = 4
+)
+usc2.tcells@meta.data$clusters <- factor(paste0(
+  "G",
+  usc2.tcells@meta.data$pearsongraph_res.1
+))
+
+DimPlot(
+  usc2.tcells, 
+  group.by = "celltype_despotx",
+  label = T,
+  label.size = 4,
+  raster = T,
+  repel = T,
+  reduction = "pearsonumap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction - DespotX") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc2.tcells, 
+  group.by = "clusters",
+  label = T,
+  label.size = 4,
+  raster =T,
+  repel = T,
+  reduction = "pearsonumap") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction - DespotX") +
+  theme(legend.position = "none")
+
+
+
+# Conversion of Seurat object into a h5ad object / file
+# =====================================================
+tc = counts_mat <- Matrix::t(usc2.tcells[["RNA"]]$counts)
+
+# 2. Cell metadata — the column DeSpotX will condition on via --cell-type-col.
+obs_df <- data.frame(
+  cluster = as.character(usc2.tcells$clusters),
+  row.names = colnames(usc2.tcells)
+)
+
+# 3. Gene metadata — var_names only strictly required by DeSpotX.
+var_df <- data.frame(row.names = rownames(usc2.tcells[["RNA"]]))
+
+# 4. Spatial coordinates — must be EXACTLY 2D (x, y).
+coords <- GetTissueCoordinates(usc2.tcells, image = "TA649")
+coords <- coords[match(colnames(usc2.tcells), coords$cell), c("x", "y")]
+spatial_mat <- as.matrix(coords)
+
+# 5. Assemble....
+usc2.tcells.adata <- make_anndata(
+  X    = counts_mat,
+  obs  = obs_df,
+  var  = var_df,
+  obsm = list(spatial = spatial_mat)
+)
+
+# 6. Force CSR before writing — via the raw Python object, not the R6 $X<- setter
+py_ad <- usc2.tcells.adata$.get_py_object()
+sp <- reticulate::import("scipy.sparse", convert = FALSE)
+py_ad$X <- sp$csr_matrix(py_ad$X)
+
+# sanity check before writing
+cat("X format:", as.character(py_ad$X$format), "\n")   # should print "csr"
+cat("X shape:", paste(reticulate::py_to_r(py_ad$X$shape), collapse=" x "), "\n")
+
+# 7. Write directly from the raw python object (bypasses the R6 wrapper entirely).
+py_ad$write_h5ad("usc2.tcells.h5ad")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Two complementary approaches: **DecontX** (R / `celda`, cluster-based, CPU) run
+inline here.
+
+### 8.1 DecontX (celda, cluster-based)
+
+
+```{r decontx, fig.width=5, fig.height=4, cache=T}
+
+counts_rna <- GetAssayData(usc2, assay = "RNA", layer = "counts")   # genes x cells
+dcx <- celda::decontX(
+  x    = as(counts_rna, "CsparseMatrix"),
+  z    = as.character(usc2$clusters),                                # cluster anchors
+  seed = 1
+)
+
+usc2$decontX_contamination <- dcx$contamination
+usc2[["decontX"]] <- CreateAssay5Object(counts = dcx$decontXcounts)
+print(round(tapply(usc2$decontX_contamination, usc2$clusters, mean), 3))
+
+#delete tmp_variables....
+rm(counts_rna)
+rm(dcx)
+
+# contamination on the Harmony UMAP + per-cluster distribution
+FeaturePlot(
+  usc2, "decontX_contamination", 
+  reduction = "pearsonumap",
+  assay = "decontX") +
+  ggtitle("DecontX contamination")
+
+ggplot(
+  usc2@meta.data, aes(clusters, decontX_contamination, fill = clusters)) +
+  geom_boxplot(outlier.size = 0.1) + theme_clean(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  labs(x = NULL, y = "contamination", title = "Contamination by cluster")
+
+```
+
+Since contamination is moderate and uneven across clusters,
+we redo the PCA → Harmony → UMAP → clustering pipeline
+on the `decontX` assay.
+
+```{r decontx_reembed, fig.width=5, fig.height=4, cache=T}
+
+DefaultAssay(usc2) = "decontX"
+
+tc <- Matrix::colSums(usc2[["decontX"]]$counts)
+genefreq_batch <- 
+  gene_frequency(usc2[["decontX"]]$counts, obs = data.table(usc2@meta.data)[,.(cell_id, sample_id)]
+                 ,cellid_colname = "cell_id"
+                 ,batch_variable = "sample_id")
+
+usc2 = FindVariableFeatures(usc2, nfeatures = 700)
+hvgs <- VariableFeatures(usc2, assay = "RNA")
+
+### Returns a Seurat-style DimReduc object with 
+pcaobj_batch <- 
+  sparse_quasipoisson_pca_seurat_batch(usc2[["decontX"]]$counts[hvgs,]
+                                       ,totalcounts = tc
+                                       ,grate = genefreq_batch[hvgs,]
+                                       ,obs =data.table(usc2@meta.data)[,.(cell_id, sample_id)] 
+                                       ,batch_variable = "sample_id"
+                                       ,cellid_colname = "cell_id"
+                                       ,scale.max = 10
+                                       ,do.scale = TRUE
+                                       ,do.center = TRUE,
+                                       ncores = 8
+  )
+#perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc2[["pearsonpca_decontX"]] <- pcaobj_batch$reduction.data
+usc2[["pearsonumap_decontX"]] <- umapobj$ump  
+usc2[["pearsongraph_decontX"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc2 <- Seurat::FindClusters(
+  usc2,
+  resolution = 1,
+  algorithm = 4,
+  graph = "pearsongraph_decontX")
+usc2@meta.data$clusters_decontx <- paste0(
+  "G",
+  usc2@meta.data$pearsongraph_res.1)
+
+# Plotting...
+DimPlot(
+  usc2, 
+  group.by = "sample_id",
+  label = F,
+  label.size = 3,
+  raster = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc2, 
+  group.by = "clusters_decontx",
+  label = T,
+  raster = T,
+  label.size = 3,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — RNA, scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+
+```{r scPearson_decontX_markers, fig.width=5, fig.height=10, cache=T}
+
+# Set default reductions
+Idents(usc2) = usc2$clusters_decontx
+
+usc2 <- NormalizeData(
+  usc2,
+  assay = "RNA",
+  normalization.method = "RC",
+  verbose = T
+)
+
+markers_decontX <- FindAllMarkers(
+  usc2,
+  assay           = "RNA",
+  only.pos        = FALSE,
+  min.pct         = 0.05,
+  logfc.threshold = 0.1,
+  test.use        = "wilcox"
+)
+
+markers_reliable <- markers_decontX |>
+  dplyr::filter(
+    p_val_adj < 0.05,
+    abs(avg_log2FC) >= 0.25,
+    abs(pct.1 - pct.2) >= 0.10
+  )
+
+#write tables
+fwrite(markers_decontX, file = "markers_decontX.tsv", sep="\t")
+
+top_markers = markers_reliable %>%
+  group_by(cluster) %>%
+  slice_head(n=10) %>%
+  data.table()
+
+# show Heatmap of markers
+markers.mat = Seurat::AverageExpression(
+  usc2,
+  features = top_markers$gene %>% unique(),
+  assay = "RNA", slot = "counts"
+)$RNA %>% data.frame()
+
+pheatmap::pheatmap(markers.mat, scale="row", fontsize_row = 1)
+
+```
+
+Let's look the expression of canonical markers in the data
+
+
+```{r hierratype_decontX, fig.width=15, fig.height=7, cache=T}
+
+fctbl_rna <- clusterwise_foldchange_metrics(usc2[["decontX"]]$counts[hvgs,]
+                                            ,totalcounts = tc
+                                            ,metadata = usc2@meta.data
+                                            ,cluster_column = "celltype_decontX"
+                                            )
+
+evidence_genes <- list(
+  "Hepatocytes.1" = c("FASN","ACSL5","MSMO1","AQP9","TBX3","GJB1"),
+  "Hepatocytes.2" = c("PLA2G2A","CHI3L1","SERPINE1","CREB3L3","GHR","LSR"),
+  "Hepatocytes.3" = c("GCGR","HLF","KLKB1","PROX1"),
+  "Hepatocytes.4" = c("CXCL9","CXCL10","GBP1","GBP4","GBP5","STAT1","ISG15"),
+  "Hepatocytes.5" = c("BCHE","TFPI","CCL16","COX1","COX2"),
+  "Macrophages"   = c("MARCO","CD5L","CD163","VSIG4","C1QA","C1QB","C1QC",
+                       "GPNMB","LGALS3","HLA-DQA1","HLA-DRA"),
+  "Fibroblasts.1" = c("COL1A1","COL3A1","ACTA2","TAGLN","PDGFRB"),
+  "Fibroblasts.2" = c("RELN","HGF","AGTR1","RGS5"),
+  "Endothelials"  = c("STAB1","KDR","CLDN5","CDH5","LYVE1"),
+  "T/NK.cells"    = c("CD8B","GNLY","GZMA","TRBC1","CD27"),
+  "Plasma.cells"  = c("IGKC","IGLC1/2","IGLL5","JCHAIN","MZB1","POU2AF1"),
+  "Cholangiocytes"= c("KRT7","KRT19","EPCAM","SOX9","CDH1"),
+  "Proliferating" = c("TOP2A","CCNB1","PCNA","STMN1"),
+  "Monocytes.Neutrophils" = c("S100A8","S100A9","FCN1","CSF3R","NCF1")
+)
+
+fctbl_rna = fctbl_rna %>% filter(gene %in% unique(unlist(evidence_genes)))
+hm_rna <- add_ncells(marker_heatmap(fctbl_rna)) + labs(title = "rna heatmap")
+print(hm_rna)
+
+```
+
+
+Seems reaaalyy good ...Let's proceed now with annotation...
+
+```{r decontX_annotation, fig.width=5, fig.height=4, cache=T}
+
+usc2$celltype_decontX <- dplyr::case_when(
+  usc2$clusters_decontx == "G1"  ~ "Hepatocytes.1",   # lipogenic (FASN, ACSL5, MSMO1)
+  usc2$clusters_decontx == "G4"  ~ "Hepatocytes.2",   # acute-phase/stress (SERPINE1, CREB3L3)
+  usc2$clusters_decontx == "G5"  ~ "Hepatocytes.3",   # periportal/gluconeogenic (GCGR, HLF)
+  usc2$clusters_decontx == "G9"  ~ "Hepatocytes.4",   # IFN-γ-stimulated (CXCL9/10, GBP1-5, STAT1)
+  usc2$clusters_decontx == "G13" ~ "Hepatocytes.5",   # core/purest hepatocyte (BCHE, TFPI, CCL16)
+
+  usc2$clusters_decontx == "G3"  ~ "Macrophages",     # Kupffer + scar-associated merged this round
+
+  usc2$clusters_decontx == "G6"  ~ "Fibroblasts.1",   # activated myofibroblast (COL1A1, ACTA2)
+  usc2$clusters_decontx == "G7"  ~ "Fibroblasts.2",   # quiescent HSC/portal (RELN, HGF, AGTR1)
+
+  usc2$clusters_decontx == "G10" ~ "Endothelials",    # LSEC (STAB1, KDR, CLDN5, LYVE1)
+
+  usc2$clusters_decontx == "G2"  ~ "T/NK.cells",
+
+  usc2$clusters_decontx == "G8"  ~ "Plasma.cells",    # kappa + lambda merged this round
+
+  usc2$clusters_decontx == "G11" ~ "Cholangiocytes",
+
+  usc2$clusters_decontx == "G12" ~ "Proliferating",   # pure cell-cycle signature, lineage-ambiguous
+
+  usc2$clusters_decontx == "G14" ~ "Monocytes/Neutrophils",
+
+  TRUE ~ "Undefined"
+)
+
+celltype_colors <- c(
+  # Hepatocytes — blue shades (5 substates)
+  "Hepatocytes.1" = "#08306B",
+  "Hepatocytes.2" = "#08519C",
+  "Hepatocytes.3" = "#2171B5",
+  "Hepatocytes.4" = "#4292C6",
+  "Hepatocytes.5" = "#6BAED6",
+
+  "Macrophages"   = "#E6550D",
+
+  # Fibroblasts — purple shades
+  "Fibroblasts.1" = "#6A3D9A",
+  "Fibroblasts.2" = "#A27AC3",
+
+  # Other major lineages
+  "Endothelials"          = "#00A087",
+  "T/NK.cells"            = "#33A02C",
+  "Plasma.cells"          = "#C51B7D",
+  "Cholangiocytes"        = "#D8A600",
+  "Proliferating"         = "#525252",
+  "Monocytes/Neutrophils" = "#CB181D",
+  "Undefined"             = "#BDBDBD"
+)
+
+
+DimPlot(
+  usc2, 
+  group.by = "clusters_decontx",
+  label = T,
+  raster = T,
+  label.size = 4,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+
+DimPlot(
+  usc2, 
+  group.by = "celltype_decontX",
+  cols = celltype_colors,
+  label = T,
+  raster = T,
+  label.size = 3,
+  repel = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+In order to better characterize T.cells subtypes ....  I select immunes types and reperform dim
+reduc analysis
+
+
+```{r immune_selection, fig.width=5, fig.height=4, cache=T}
+
+usc2_immune = subset(
+  usc2,
+  (clusters %in% c("G14","G3"))
+)
+
+DefaultAssay(usc2_immune) = "RNA"
+
+DimPlot(
+  usc2_immune, 
+  group.by = "celltype_decontX",
+  cols = celltype_colors,
+  label = T,
+  raster = T,
+  label.size = 3,
+  repel = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+
+```{r immune_scPearson_dimReduc, fig.width=4, fig.height=4, cache=T}
+
+tc <- Matrix::colSums(usc2_immune[["RNA"]]$counts)
+genefreq_batch <- 
+  gene_frequency(usc2_immune[["RNA"]]$counts, obs = data.table(usc2_immune@meta.data)[,.(cell_id, sample_id)]
+                 ,cellid_colname = "cell_id"
+                 ,batch_variable = "sample_id")
+
+usc2_immune = FindVariableFeatures(usc2_immune, nfeatures = 6215)
+hvgs <- VariableFeatures(usc2_immune, assay = "RNA")
+
+### Returns a Seurat-style DimReduc object with 
+pcaobj_batch <- 
+  sparse_quasipoisson_pca_seurat_batch(usc2_immune[["RNA"]]$counts[hvgs,]
+                                       ,totalcounts = tc
+                                       ,grate = genefreq_batch[hvgs,]
+                                       ,obs =data.table(usc2_immune@meta.data)[,.(cell_id, sample_id)] 
+                                       ,batch_variable = "sample_id"
+                                       ,cellid_colname = "cell_id"
+                                       ,scale.max = 10
+                                       ,do.scale = TRUE
+                                       ,do.center = TRUE
+  )
+#perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc2_immune[["pearsonpca"]] <- pcaobj_batch$reduction.data
+usc2_immune[["pearsonumap"]] <- umapobj$ump  
+usc2_immune[["pearsongraph"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc2_immune <- Seurat::FindClusters(usc2_immune, resolution = 1.5, graph = "pearsongraph", algorithm = 4)
+usc2_immune@meta.data$clusters <- usc2_immune@meta.data$pearsongraph_res.1.5
+
+DimPlot(
+  usc2_immune, 
+  group.by = "sample_id",
+  label = F,
+  label.size = 4,
+  raster = T,
+  reduction = "pearsonumap") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP macrophages cells — RNA, scPearson Batch correction") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc2_immune, 
+  group.by = "clusters",
+  label = T,
+  label.size = 4,
+  raster = T,
+  reduction = "pearsonumap") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP macrophages cells — RNA, scPearson Batch correction") +
+  theme(legend.position = "none")
+
+```
+
+Let's perform now another round of decontamintaion of this subset
+This time I will use on the tools suggested by Vivek that I think perform way better than decontX
+to remove contamination related to the hepatocytes,
+
+```{r immune_decontX,  fig.width=4, fig.height=4, cache=T}
+
+counts_rna <- GetAssayData(usc2_immune, assay = "RNA", layer = "counts")   # genes x cells
+dcx <- celda::decontX(
+  x    = as(counts_rna, "CsparseMatrix"),
+  z    = as.character(usc2_immune$clusters),                                # cluster anchors
+  seed = 1
+)
+
+usc2_immune$decontX_contamination <- dcx$contamination
+usc2_immune[["decontX"]] <- CreateAssay5Object(counts = dcx$decontXcounts)
+print(round(tapply(usc2_immune$decontX_contamination, usc2_immune$clusters, mean), 3))
+
+#delete tmp_variables....
+rm(counts_rna)
+rm(dcx)
+
+# contamination on the Harmony UMAP + per-cluster distribution
+FeaturePlot(
+  usc2_immune, "decontX_contamination", 
+  reduction = "pearsonumap",
+  assay = "decontX") +
+  ggtitle("DecontX contamination")
+
+ggplot(
+  usc2_immune@meta.data, aes(clusters, decontX_contamination, fill = clusters)) +
+  geom_boxplot(outlier.size = 0.1) + theme_clean(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  labs(x = NULL, y = "contamination", title = "Contamination by cluster")
+
+
+```
+
+```{r immune_dimreduc_decontX, fig.width=5, fig.height=4, cache=T}
+
+DefaultAssay(usc2_immune) = "decontX"
+
+tc <- Matrix::colSums(usc2_immune[["decontX"]]$counts)
+genefreq_batch <- 
+gene_frequency(usc2_immune[["decontX"]]$counts, obs = data.table(usc2_immune@meta.data)[,.(cell_id, sample_id)]
+               ,cellid_colname = "cell_id"
+               ,batch_variable = "sample_id")
+
+usc2_immune = FindVariableFeatures(usc2_immune, nfeatures = 6215)
+hvgs <- VariableFeatures(usc2_immune, assay = "RNA")
+
+### Returns a Seurat-style DimReduc object with 
+pcaobj_batch <- 
+sparse_quasipoisson_pca_seurat_batch(usc2_immune[["decontX"]]$counts[hvgs,]
+                                     ,totalcounts = tc
+                                     ,grate = genefreq_batch[hvgs,]
+                                     ,obs =data.table(usc2_immune@meta.data)[,.(cell_id, sample_id)] 
+                                     ,batch_variable = "sample_id"
+                                     ,cellid_colname = "cell_id"
+                                     ,scale.max = 10
+                                     ,do.scale = TRUE
+                                     ,do.center = TRUE,
+                                     ncores = 8
+                                     )
+#perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc2_immune[["pearsonpca_decontX"]] <- pcaobj_batch$reduction.data
+usc2_immune[["pearsonumap_decontX"]] <- umapobj$ump  
+usc2_immune[["pearsongraph_decontX"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc2_immune <- Seurat::FindClusters(usc2_immune, resolution = 1.5, graph = "pearsongraph_decontX", algorithm = 4, verbose = T)
+usc2_immune@meta.data$clusters_macro <- paste0(
+  "G",
+  usc2_immune@meta.data$pearsongraph_decontX_res.1.5)
+
+DimPlot(
+  usc2_immune, 
+  group.by = "sample_id",
+  label = F,
+  label.size = 3,
+  raster = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP macrophages scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc2_immune, 
+  group.by = "clusters_macro",
+  label = T,
+  raster = T,
+  label.size = 3,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP macrophages scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+```{r immune_dimreduc_decontX_markers,  fig.width=4, fig.height=9, cache=T}
+
+# Set default reductions
+Idents(usc2_immune) = usc2_immune$clusters_macro
+
+usc2_immune <- NormalizeData(
+  usc2_immune,
+  assay = "RNA",
+  normalization.method = "RC",
+  verbose = FALSE
+)
+
+markers_decontX <- FindAllMarkers(
+  usc2_immune,
+  assay           = "RNA",
+  only.pos        = FALSE,
+  min.pct         = 0.05,
+  logfc.threshold = 0.05,
+  test.use        = "wilcox"
+)
+
+markers_reliable <- markers_decontX |>
+  dplyr::filter(
+    p_val_adj < 0.05,
+    abs(avg_log2FC) >= 0.25,
+    abs(pct.1 - pct.2) >= 0.10
+)
+
+#write tables
+fwrite(markers_decontX, file = "markers_decontX_immune.tsv", sep="\t")
+
+# top_markers = markers_reliable %>%
+#   group_by(cluster) %>%
+#   slice_head(n=10) %>%
+#   data.table()
+# 
+# # show Heatmap of markers
+# markers.mat = Seurat::AverageExpression(
+#   usc2_immune,
+#   features = top_markers$gene %>% unique(),
+#   assay = "RNA", slot = "counts"
+#   )$RNA %>% data.frame()
+
+# pheatmap::pheatmap(markers.mat, scale="row", fontsize_row = 5)
+
+```
+
+
+```{r immune_annotation, fig.width=5, fig.height=5, cache=T}
+usc2_immune$celltype_immune <- dplyr::case_when(
+  usc2_immune$clusters_macro == "G3"  ~ "Macrophages/Kupffer.1",   # Kupffer, resident/core — VSIG4+MARCO+CD5L+FOLR2+CD163
+  usc2_immune$clusters_macro == "G9"  ~ "Macrophages/Kupffer.2",   # Kupffer-related, MRC1-high (KC2-leaning, FOLR2-negative)
+  usc2_immune$clusters_macro == "G13" ~ "Macrophages/SAM",   # scar-associated (SAM) — GPNMB+LGALS3+FABP5+CD9+CD63
+
+  usc2_immune$clusters_macro == "G7"  ~ "Dendritic.cells",     # CIITA/IRF8/IDO1, pan-macrophage core negative
+  usc2_immune$clusters_macro == "G8"  ~ "Recruited.myeloid",   # VCAN+FCN1+S100A8/9+CXCR1/2, pan-macrophage strongly negative
+
+  usc2_immune$clusters_macro == "G1"  ~ "Contaminant.1",    # Hepatocytes
+  usc2_immune$clusters_macro == "G6"  ~ "Contaminant.2",    # Fibroblasts (weak SAM/macrophage bleed — likely real scar-niche admixture, not noise)
+  usc2_immune$clusters_macro == "G10" ~ "Contaminant.3",    # T/NK cells
+  usc2_immune$clusters_macro == "G12" ~ "Contaminant.4",    # Plasma cells
+  usc2_immune$clusters_macro == "G11" ~ "Contaminant.5",    # Hepatocytes, stressed/heat-shock overlay
+
+  usc2_immune$clusters_macro == "G2"  ~ "Undefined.1",
+  usc2_immune$clusters_macro == "G4"  ~ "Undefined.2",
+  usc2_immune$clusters_macro == "G5"  ~ "Undefined.3",
+
+  TRUE ~ "Undefined"
+)
+
+celltype_colors <- c(
+  "Macrophages/Kupffer.1"     = "#E6550D",
+  "Macrophages/Kupffer.2"     = "#A63603",
+  "Macrophages/SAM"     = "#FD8D3C",
+
+  "Dendritic.cells"   = "#31A354",
+  "Recruited.myeloid" = "#8C510A",
+
+  "Contaminant.1" = "#F0F0F0",
+  "Contaminant.2" = "#D9D9D9",
+  "Contaminant.3" = "#BDBDBD",
+  "Contaminant.4" = "#A3A3A3",
+  "Contaminant.5" = "#898989",
+
+  "Undefined.1" = "#404040",
+  "Undefined.2" = "#2A2A2A",
+  "Undefined.3" = "#151515",
+  "Undefined"   = "#000000"
+)
+
+DimPlot(
+  usc2_immune, 
+  group.by = "clusters_macro",
+  label = T,
+  raster = T,
+  label.size = 3,
+  repel = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc2_immune, 
+  group.by = "celltype_immune",
+  cols = celltype_colors,
+  label = T,
+  raster = T,
+  label.size = 3,
+  repel = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+```{r hieratype_macrophages, fig.width=10, fig.height=5, cache=T}
+
+
+fctbl_rna <- clusterwise_foldchange_metrics(usc2_immune[["decontX"]]$counts[hvgs,]
+                                            ,totalcounts = tc
+                                            ,metadata = usc2_immune@meta.data
+                                            ,cluster_column = "celltype_immune"
+                                            )
+
+
+evidence_genes <- list(
+  "Macrophages.1" = c("VSIG4","MARCO","CD5L","FOLR2","SLC40A1","HMOX1","CD163"),
+  # Kupffer, resident/core — FOLR2+ is what separates this from Macrophages.2
+
+  "Macrophages.2" = c("MRC1","MARCO","CD5L","CD163","HMOX1","VSIG4"),
+  # Kupffer-related, MRC1-high/KC2-leaning — same core minus FOLR2, MRC1 is the standout
+
+  "Macrophages.3" = c("GPNMB","LGALS3","CD9","FABP5","CD63"),
+  # scar-associated (SAM) — GPNMB/LGALS3/FABP5 axis specifically
+
+  "Dendritic.cells" = c("CIITA","IRF8","IDO1","HLA-DMA","HLA-DQA1","HLA-DQB1",
+                         "HLA-DPA1","HLA-DPB1","HLA-DRA","HLA-DRB","ITGAX"),
+  # pan-macrophage core (CD68/C1QA-C/CD163) is NEGATIVE here — this is what distinguishes it from macrophages
+
+  "Recruited.myeloid" = c("VCAN","FCN1","S100A8","S100A9","CXCR1","CXCR2","CD14","CSF3R")
+  # neutrophil + classical monocyte mixed — pan-macrophage core strongly negative
+)
+
+fctbl_rna = fctbl_rna %>% filter(gene %in% unique(unlist(evidence_genes)))
+
+fctbl_rna$cluster = factor(
+  fctbl_rna$cluster,
+  levels = c("Macrophages/Kupffer.1", "Macrophages/Kupffer.2", "Dendritic.cells", "Macrophages/SAM",
+             "Recruited.myeloid", "Contaminant.2", "Contaminant.4", "Contaminant.5",
+             "Undefined.1", "Undefined.2", "Contaminant.3", "Undefined.3", "Contaminant.1")
+)
+
+hm_rna <- add_ncells(marker_heatmap(fctbl_rna)) + labs(title = "rna heatmap")
+print(hm_rna)
+
+```
+
+
+
+```{r tcells_selection, fig.width=4, fig.height=4, cache=T}
+
+usc2_tcells = subset(
+  usc2,
+  (clusters %in% c("G2"))
+)
+
+DefaultAssay(usc2_tcells) = "RNA"
+
+DimPlot(
+  usc2_tcells, 
+  group.by = "celltype_decontX",
+  label = T,
+  raster = T,
+  label.size = 3,
+  repel = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+```{r tcells_scPearson_dimReduc, fig.width=4, fig.height=4, cache=T}
+
+tc <- Matrix::colSums(usc2_tcells[["RNA"]]$counts)
+genefreq_batch <- 
+gene_frequency(usc2_tcells[["RNA"]]$counts, obs = data.table(usc2_tcells@meta.data)[,.(cell_id, sample_id)]
+               ,cellid_colname = "cell_id"
+               ,batch_variable = "sample_id")
+
+usc2_tcells = FindVariableFeatures(usc2_tcells, nfeatures = 6125)
+hvgs <- VariableFeatures(usc2_tcells, assay = "RNA")
+
+### Returns a Seurat-style DimReduc object with 
+pcaobj_batch <- 
+sparse_quasipoisson_pca_seurat_batch(usc2_tcells[["RNA"]]$counts[hvgs,]
+                                     ,totalcounts = tc
+                                     ,grate = genefreq_batch[hvgs,]
+                                     ,obs =data.table(usc2_tcells@meta.data)[,.(cell_id, sample_id)] 
+                                     ,batch_variable = "sample_id"
+                                     ,cellid_colname = "cell_id"
+                                     ,scale.max = 10
+                                     ,do.scale = TRUE
+                                     ,do.center = TRUE,
+                                     ncores = 8
+                                     )
+#perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc2_tcells[["pearsonpca"]] <- pcaobj_batch$reduction.data
+usc2_tcells[["pearsonumap"]] <- umapobj$ump  
+usc2_tcells[["pearsongraph"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc2_tcells <- Seurat::FindClusters(usc2_tcells, resolution = 1.4, graph = "pearsongraph")
+usc2_tcells@meta.data$clusters_tcells <- usc2_tcells@meta.data$pearsongraph_res.1.4
+
+DimPlot(
+  usc2_tcells, 
+  group.by = "sample_id",
+  label = F,
+  label.size = 3,
+  raster = T,
+  reduction = "pearsonumap") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP Tcells  — RNA, scPearson Batch correction") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc2_tcells, 
+  group.by = "clusters_tcells",
+  label = T,
+  label.size = 3,
+  raster = T,
+  reduction = "pearsonumap") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP Tcells  — RNA, scPearson Batch correction") +
+  theme(legend.position = "none")
+
+```
+
+Let's perform now another round of decontamintaion of this subset
+
+```{r immune_decontX,  fig.width=4, fig.height=4, cache=T}
+
+counts_rna <- GetAssayData(usc2_tcells, assay = "RNA", layer = "counts")   # genes x cells
+dcx <- celda::decontX(
+  x    = as(counts_rna, "CsparseMatrix"),
+  z    = as.character(usc2_tcells$clusters_tcells),                                # cluster anchors
+  seed = 1
+)
+
+usc2_tcells$decontX_contamination <- dcx$contamination
+usc2_tcells[["decontX"]] <- CreateAssay5Object(counts = dcx$decontXcounts)
+
+#delete tmp_variables....
+rm(counts_rna)
+rm(dcx)
+
+# contamination on the Harmony UMAP + per-cluster distribution
+FeaturePlot(
+  usc2_tcells, "decontX_contamination", 
+  reduction = "pearsonumap",
+  assay = "decontX") +
+  ggtitle("DecontX contamination")
+
+ggplot(
+  usc2_tcells@meta.data, aes(clusters_tcells, decontX_contamination, fill = clusters_tcells)) +
+  geom_boxplot(outlier.size = 0.1) + theme_clean(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  labs(x = NULL, y = "contamination", title = "Contamination by cluster")
+
+
+```
+
+
+```{r tcells_dimreduc_decontX, fig.width=4, fig.height=4, cache=T}
+
+DefaultAssay(usc2_tcells) = "decontX"
+
+tc <- Matrix::colSums(usc2_tcells[["decontX"]]$counts)
+genefreq_batch <- 
+  gene_frequency(usc2_tcells[["decontX"]]$counts, obs = data.table(usc2_tcells@meta.data)[,.(cell_id, sample_id)]
+                 ,cellid_colname = "cell_id"
+                 ,batch_variable = "sample_id")
+
+usc2_tcells = FindVariableFeatures(usc2_tcells, nfeatures = 6215)
+hvgs <- VariableFeatures(usc2_tcells, assay = "RNA")
+
+### Returns a Seurat-style DimReduc object with 
+pcaobj_batch <- 
+  sparse_quasipoisson_pca_seurat_batch(usc2_tcells[["decontX"]]$counts[hvgs,]
+                                       ,totalcounts = tc
+                                       ,grate = genefreq_batch[hvgs,]
+                                       ,obs =data.table(usc2_tcells@meta.data)[,.(cell_id, sample_id)] 
+                                       ,batch_variable = "sample_id"
+                                       ,cellid_colname = "cell_id"
+                                       ,scale.max = 10
+                                       ,do.scale = TRUE
+                                       ,do.center = TRUE,
+                                       ncores = 8
+  )
+#perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc2_tcells[["pearsonpca_decontX"]] <- pcaobj_batch$reduction.data
+usc2_tcells[["pearsonumap_decontX"]] <- umapobj$ump  
+usc2_tcells[["pearsongraph_decontX"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc2_tcells <- Seurat::FindClusters(usc2_tcells, resolution = 2, graph = "pearsongraph_decontX", algorithm = 4)
+usc2_tcells@meta.data$clusters_tcells_decontx <- paste0(
+  "G",
+  usc2_tcells@meta.data$pearsongraph_decontX_res.2)
+
+DimPlot(
+  usc2_tcells, 
+  group.by = "sample_id",
+  label = F,
+  label.size = 3,
+  raster = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP Tcells scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc2_tcells, 
+  group.by = "clusters_tcells_decontx",
+  label = T,
+  raster = T,
+  label.size = 3,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP Tcells scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+
+```{r tcells_markers,  fig.width=4, fig.height=9, cache=T}
+
+# Set default reductions
+Idents(usc2_tcells) = usc2_tcells$clusters_tcells_decontx
+
+usc2_tcells <- NormalizeData(
+  usc2_tcells,
+  assay = "RNA",
+  normalization.method = "RC",
+)
+
+markers_decontX <- FindAllMarkers(
+  usc2_tcells,
+  assay           = "RNA",
+  only.pos        = FALSE,
+  min.pct         = 0.01,
+  logfc.threshold = 0.05,
+  test.use        = "wilcox"
+)
+
+markers_reliable <- markers_decontX |>
+  dplyr::filter(
+    p_val_adj < 0.05,
+    abs(avg_log2FC) >= 0.25,
+    abs(pct.1 - pct.2) >= 0.10
+  )
+
+#write tables
+fwrite(markers_decontX, file = "markers_decontX_tcells.tsv", sep="\t")
+
+
+# top_markers = markers_reliable %>%
+#   group_by(cluster) %>%
+#   slice_head(n=30) %>%
+#   data.table()
+# 
+# # show Heatmap of markers
+# markers.mat = Seurat::AverageExpression(
+#   usc2_tcells,
+#   features = top_markers$gene %>% unique(),
+#   assay = "RNA", slot = "counts"
+# )$RNA %>% data.frame()
+# 
+# pheatmap::pheatmap(markers.mat, scale="row", fontsize_row = 5)
+
+```
+
+
+
+```{r hieratype_tcells,  fig.width=10, fig.height=5, cache=T}
+
+data("markerslist_tcellmajor")
+data(pipeline_tcell)
+
+fct <- clusterwise_foldchange_metrics(counts = usc2_tcells[["decontX"]]$counts[hvgs,],
+                                      ,metadata = usc2_tcells@meta.data,
+                                      ,cluster_column = "clusters_tcells_decontx")
+idxs <- unique(unname(c(unlist(lapply(HieraType::markerslist_cd4tminor, "[[", "index_marker"))
+               ,unlist(lapply(HieraType::markerslist_cd8tminor, "[[", "index_marker")))))
+
+nms <- c("cd4t", names(HieraType::markerslist_cd4tminor), "cd8t", names(HieraType::markerslist_cd8tminor))
+hmsubtype <- marker_heatmap(
+  fct, 
+  featsuse = unique(c("CD8A", "CD8B", "CD4", idxs)), 
+  fold_change_min = 0.05, 
+  cluster_prop_min = 0.05, 
+  topleft_to_bottomright = F) ;print(hmsubtype)
+
+
+```
+
+
+
+
+```{r tcells_annotation, fig.width=6, fig.height=4, cache=T}
+
+usc2_tcells$celltype_tcell <- dplyr::case_when(
+  usc2_tcells$clusters_tcells_decontx == "G5"  ~ "cd8_tem_cytotoxic",   # fold_change 2.50/1.95 — clear signal
+  usc2_tcells$clusters_tcells_decontx == "G3"  ~ "cd4_treg",            # 1.48
+  usc2_tcells$clusters_tcells_decontx == "G8"  ~ "cd4_cd8_tcm",         # 1.74
+  usc2_tcells$clusters_tcells_decontx == "G13" ~ "cd8_exhausted",       # 1.50, but only 64 cells — tentative
+  usc2_tcells$clusters_tcells_decontx == "G6"  ~ "naive_like",          # 1.33/1.30, cd4/cd8 tied
+  usc2_tcells$clusters_tcells_decontx == "G9"  ~ "cd8_exhausted_cytotoxic",  # 1.31/1.27, weak
+  usc2_tcells$clusters_tcells_decontx == "G4"  ~ "cd4_th2",             # 1.29, weak
+  usc2_tcells$clusters_tcells_decontx == "G11" ~ "cd4_tem",             # 1.27, weak
+  usc2_tcells$clusters_tcells_decontx == "G2"  ~ "cd4_th2_treg",        # 1.27/1.23, weak/ambiguous
+  usc2_tcells$clusters_tcells_decontx == "G10" ~ "cd8_tem",             # 1.20, weak
+
+  usc2_tcells$clusters_tcells_decontx == "G1"  ~ "Undefined.1",   # max fold_change 0.78 — no signal, matches contaminated UMAP island
+  usc2_tcells$clusters_tcells_decontx == "G7"  ~ "Undefined.2",   # max fold_change 1.18 — no signal
+  usc2_tcells$clusters_tcells_decontx == "G12" ~ "Undefined.3",   # max fold_change 1.07 — no signal
+
+  TRUE ~ "Undefined"
+)
+
+
+celltype_colors_tcell <- c(
+  # CD8 lineage — blue shades (darker = higher confidence)
+  "cd8_tem_cytotoxic"       = "#08519C",  # G5, strong signal
+  "cd8_exhausted"           = "#3182BD",  # G13, tentative (n=64)
+  "cd8_exhausted_cytotoxic" = "#6BAED6",  # G9, weak
+  "cd8_tem"                 = "#C6DBEF",  # G10, weak
+
+  # CD4 lineage — green/purple shades
+  "cd4_treg"    = "#6A3D9A",  # G3, moderate
+  "cd4_th2"     = "#DE77AE",  # G4, weak
+  "cd4_tem"     = "#A6D96A",  # G11, weak
+
+  # mixed / shared / ambiguous calls
+  "cd4_cd8_tcm"  = "#1B7837",  # G8, moderate
+  "naive_like"   = "#41AB5D",  # G6, moderate
+  "cd4_th2_treg" = "#C994C7",  # G2, weak/ambiguous
+
+  "Undefined.1" = "#404040",
+  "Undefined.2" = "#2A2A2A",
+  "Undefined.3" = "#151515"
+)
+
+
+DimPlot(
+  usc2_tcells, 
+  group.by = "clusters_tcells_decontx",
+  # cols = celltype_colors,
+  label = T,
+  raster = T,
+  label.size = 3,
+  repel = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc2_tcells, 
+  group.by = "celltype_tcell",
+  # cols = celltype_colors,
+  label = T,
+  raster = T,
+  label.size = 3,
+  repel = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+
+
+```{r hieratype_ctypes_tcells, fig.width=10, fig.height=5, cache=T}
+
+
+data("markerslist_tcellmajor")
+data(pipeline_tcell)
+
+fct <- clusterwise_foldchange_metrics(counts = usc2_tcells[["decontX"]]$counts[hvgs,],
+                                      ,metadata = usc2_tcells@meta.data,
+                                      ,cluster_column = "celltype_tcell")
+idxs <- unique(unname(c(unlist(lapply(HieraType::markerslist_cd4tminor, "[[", "index_marker"))
+               ,unlist(lapply(HieraType::markerslist_cd8tminor, "[[", "index_marker")))))
+
+nms <- c("cd4t", names(HieraType::markerslist_cd4tminor), "cd8t", names(HieraType::markerslist_cd8tminor))
+hmsubtype <- marker_heatmap(
+  fct, 
+  featsuse = unique(c("CD8A", "CD8B", "CD4", idxs)), 
+  fold_change_min = 0.05, 
+  cluster_prop_min = 0.05, 
+  topleft_to_bottomright = F) ;print(hmsubtype)
+
+
+
+```
+
+
+## 5. DeSpotX-corrected counts → assay + corrected embedding
+
+Load the DeSpotX-adjusted counts as a `despotx` assay on `usc` (same cells/order),
+carry the per-cell `epsilon` contamination, then run the same scPearson
+batch-corrected PCA/UMAP + clustering + markers as §3/§4.
+
+```{r read_despotx}
+
+suppressPackageStartupMessages({
+  library(zellkonverter); library(SingleCellExperiment); library(SummarizedExperiment)
 })
 
-patchwork::wrap_plots(plots, nrow = 2)
+DESPOTX_H5AD = "~/Projects/TA649_analysis/adjusted.h5ad"
+
+
+sce_dx <- readH5AD(DESPOTX_H5AD, reader = "R")
+
+dx_counts <- as(assay(sce_dx, assayNames(sce_dx)[1]), "CsparseMatrix")   # genes x cells
+dx_counts <- dx_counts[rownames(usc2[["RNA"]]), colnames(usc2)]           # align genes & cells
+
+usc2[["despotx"]] <- CreateAssay5Object(counts = dx_counts)
+usc2$despotx_epsilon <- as.data.frame(colData(sce_dx))[colnames(usc2), "epsilon"]
+
+rm(sce_dx, dx_counts); gc()
 ```
+
+
+
+```{r dimreduc_despotx,  fig.width=7, fig.height=7, cache=T}
+DefaultAssay(usc2) <- "despotx"
+usc3 <- NormalizeData(usc2, assay = "despotx", normalization.method = "RC")  # for markers
+
+tc <- Matrix::colSums(usc3[["despotx"]]$counts)
+
+genefreq_batch <- gene_frequency(
+  usc3[["despotx"]]$counts,
+  obs            = data.table(usc3@meta.data)[, .(cell_id, sample_id)],
+  cellid_colname = "cell_id",
+  batch_variable = "sample_id"
+)
+
+# Reuse the RNA HVG set (§3) so all three embeddings use the same genes
+hvgs <- VariableFeatures(usc3, assay = "RNA")
+
+pcaobj_batch <- sparse_quasipoisson_pca_seurat_batch(
+  usc3[["despotx"]]$counts[hvgs, ],
+  totalcounts    = tc,
+  grate          = genefreq_batch[hvgs, ],
+  obs            = data.table(usc3@meta.data)[, .(cell_id, sample_id)],
+  batch_variable = "sample_id",
+  cellid_colname = "cell_id",
+  scale.max      = 10,
+  do.scale       = TRUE,
+  do.center      = TRUE,
+  ncores = 8
+)
+
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+usc3[["pearsonpca_despotx"]]   <- pcaobj_batch$reduction.data
+usc3[["pearsonumap_despotx"]]  <- umapobj$ump
+usc3[["pearsongraph_despotx"]] <- Seurat::as.Graph(umapobj$grph)
+
+usc3 <- Seurat::FindClusters(usc3, resolution = 1.5, graph = "pearsongraph_despotx", algorithm=4)
+usc3@meta.data$clusters_despotx <- factor(paste0("G", usc3@meta.data$pearsongraph_despotx_res.1.5))
+
+# Cluster markers (despotx). Same permissive thresholds; gate on adjusted p.
+Idents(usc3) <- usc3$clusters_despotx
+
+DimPlot(
+  usc3, 
+  group.by = "sample_id",
+  label = F,
+  label.size = 3,
+  raster = T,
+  reduction = "pearsonumap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP macrophages scPearson Batch correction -> despotX applied") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc3, 
+  group.by = "clusters_despotx",
+  label = T,
+  raster = T,
+  label.size = 3,
+  reduction = "pearsonumap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP macrophages scPearson Batch correction -> deSpotX applied") +
+  theme(legend.position = "none")
+
+```
+
+
+```{r markers,  fig.width=4, fig.height=9, cache=T}
+
+# Set default reductions
+Idents(usc3) = usc3$clusters_despotx
+
+usc3 <- NormalizeData(
+  usc3,
+  assay = "RNA",
+  normalization.method = "RC",
+)
+
+markers_decontX <- FindAllMarkers(
+  usc3,
+  assay           = "RNA",
+  only.pos        = FALSE,
+  min.pct         = 0.01,
+  logfc.threshold = 0.05,
+  test.use        = "wilcox"
+)
+
+markers_reliable <- markers_decontX |>
+  dplyr::filter(
+    p_val_adj < 0.05,
+    abs(avg_log2FC) >= 0.25,
+    abs(pct.1 - pct.2) >= 0.10
+  )
+
+#write tables
+fwrite(markers_decontX, file = "markers_despotx_all.tsv", sep="\t")
+
+```
+
+
+
+```{r,  fig.width=8, fig.height=7, cache=T}
+
+usc3$celltype_despotx <- dplyr::case_when(
+  usc3$clusters_despotx == "G1"  ~ "T/NK.cells",
+
+  usc3$clusters_despotx == "G2"  ~ "Macrophages",       # Kupffer + scar-associated merged at this resolution
+
+  usc3$clusters_despotx == "G3"  ~ "Hep.pericentral.Zone3",   # CYP2E1, GLUL, ADH1A/4/6, lipogenesis
+  usc3$clusters_despotx == "G4"  ~ "Hep.periportal.Zone1.1",  # ASS1, PCK1, SDS, HAMP, ARG1
+  usc3$clusters_despotx == "G5"  ~ "Hep.midzonal.Zone2",      # weak/intermediate on both axes
+  usc3$clusters_despotx == "G8"  ~ "Hep.IFNg.stimulated",     # zonation washed out by CXCL9/10, GBP1/4, STAT1
+  usc3$clusters_despotx == "G12" ~ "Hep.periportal.Zone1.2",  # periportal, secondary population
+  usc3$clusters_despotx == "G14" ~ "Hep.periportal.Zone1.3",  # periportal, third population (CEBPA+ metabolic)
+
+  usc3$clusters_despotx == "G6"  ~ "Fibroblasts.1",     # activated myofibroblast
+  usc3$clusters_despotx == "G7"  ~ "Fibroblasts.2",     # quiescent HSC/portal
+
+  usc3$clusters_despotx == "G9"  ~ "Endothelials",
+
+  usc3$clusters_despotx == "G10" ~ "Cholangiocytes",
+
+  usc3$clusters_despotx == "G11" ~ "Proliferating",
+
+  usc3$clusters_despotx == "G13" ~ "Plasma.cells.1",    # kappa-dominant
+  usc3$clusters_despotx == "G16" ~ "Plasma.cells.2",    # lambda-dominant
+
+  usc3$clusters_despotx == "G15" ~ "Monocytes.Neutrophils",
+
+  TRUE ~ "Undefined"
+)
+
+celltype_colors_despotx <- c(
+  "T/NK.cells"    = "#33A02C",
+  "Macrophages"   = "#E6550D",
+
+  # Hepatocytes — blue shades by zone, IFN-activated pulled out in red to flag it as non-zonal
+  "Hep.pericentral.Zone3"  = "#08306B",
+  "Hep.periportal.Zone1.1" = "#2171B5",
+  "Hep.periportal.Zone1.2" = "#4292C6",
+  "Hep.periportal.Zone1.3" = "#6BAED6",
+  "Hep.midzonal.Zone2"     = "#9ECAE1",
+  "Hep.IFNg.stimulated"    = "#B2182B",
+
+  "Fibroblasts.1" = "#6A3D9A",
+  "Fibroblasts.2" = "#A27AC3",
+
+  "Endothelials"          = "#00A087",
+  "Cholangiocytes"        = "#D8A600",
+  "Proliferating"         = "#525252",
+  "Plasma.cells.1"        = "#C51B7D",
+  "Plasma.cells.2"        = "#DE77AE",
+  "Monocytes.Neutrophils" = "#CB181D",
+
+  "Undefined" = "#BDBDBD"
+)
+
+
+DimPlot(
+  usc3, 
+  group.by = "clusters_despotx",
+  label = T,
+  label.size = 3,
+  raster = T,
+  reduction = "pearsonumap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP macrophages scPearson Batch correction -> despotX applied") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc3, 
+  group.by = "celltype_despotx",
+  label = T,
+  raster = T,
+  label.size = 2.5,
+  repel = T,
+  reduction = "pearsonumap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP macrophages scPearson Batch correction -> deSpotX applied") +
+  theme(legend.position = "none")
+
+```
+
+Let's subset the T/NK cells
+
+```{r tcells_selection, fig.width=8, fig.height=7, cache=T}
+
+usc3_tcells = subset(
+  usc3,
+  (clusters %in% c("G1"))
+)
+
+DefaultAssay(usc3_tcells) = "RNA"
+
+DimPlot(
+  usc3_tcells, 
+  group.by = "celltype_despotx",
+  label = T,
+  raster = T,
+  label.size = 3,
+  repel = T,
+  reduction = "pearsonumap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+
+
+```{r tcells_scPearson_dimReduc, fig.width=8, fig.height=7, cache=T}
+
+tc <- Matrix::colSums(usc3_tcells[["RNA"]]$counts)
+genefreq_batch <- 
+gene_frequency(usc3_tcells[["RNA"]]$counts, obs = data.table(usc3_tcells@meta.data)[,.(cell_id, sample_id)]
+               ,cellid_colname = "cell_id"
+               ,batch_variable = "sample_id")
+
+usc3_tcells = FindVariableFeatures(usc3_tcells, nfeatures = 6125)
+hvgs <- VariableFeatures(usc3_tcells, assay = "RNA")
+
+### Returns a Seurat-style DimReduc object with 
+pcaobj_batch <- 
+sparse_quasipoisson_pca_seurat_batch(usc3_tcells[["RNA"]]$counts[hvgs,]
+                                     ,totalcounts = tc
+                                     ,grate = genefreq_batch[hvgs,]
+                                     ,obs =data.table(usc3_tcells@meta.data)[,.(cell_id, sample_id)] 
+                                     ,batch_variable = "sample_id"
+                                     ,cellid_colname = "cell_id"
+                                     ,scale.max = 10
+                                     ,do.scale = TRUE
+                                     ,do.center = TRUE,
+                                     ncores = 8)
+
+#perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc3_tcells[["pearsonpca_despotx"]] <- pcaobj_batch$reduction.data
+usc3_tcells[["pearsonumap_despotx"]] <- umapobj$ump  
+usc3_tcells[["pearsongraph_despotx"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc3_tcells <- Seurat::FindClusters(usc3_tcells, resolution = 1.5, graph = "pearsongraph_despotx")
+usc3_tcells@meta.data$clusters_tcells <- usc3_tcells@meta.data$pearsongraph_despotx_res.1.5
+
+DimPlot(
+  usc3_tcells, 
+  group.by = "sample_id",
+  label = F,
+  label.size = 3,
+  raster = T,
+  reduction = "pearsonumap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP Tcells  — RNA, scPearson Batch correction") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc3_tcells, 
+  group.by = "clusters_tcells",
+  label = T,
+  label.size = 3,
+  raster = T,
+  reduction = "pearsonumap_despotx") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP Tcells  — RNA, scPearson Batch correction") +
+  theme(legend.position = "none")
+
+```
+
+Let's perform now another round of decontamintaion of this subset
+
+```{r immune_despotX,  fig.width=4, fig.height=4, cache=T}
+
+counts_rna <- GetAssayData(usc3_tcells, assay = "RNA", layer = "counts")   # genes x cells
+dcx <- celda::decontX(
+  x    = as(counts_rna, "CsparseMatrix"),
+  z    = as.character(usc3_tcells$clusters_tcells),                                # cluster anchors
+  seed = 1
+)
+
+usc3_tcells$decontX_contamination <- dcx$contamination
+usc3_tcells[["decontX"]] <- CreateAssay5Object(counts = dcx$decontXcounts)
+
+#delete tmp_variables....
+rm(counts_rna)
+rm(dcx)
+
+# contamination on the Harmony UMAP + per-cluster distribution
+FeaturePlot(
+  usc3_tcells, "decontX_contamination", 
+  reduction = "pearsonumap_despotx",
+  assay = "decontX") +
+  ggtitle("DecontX contamination")
+
+ggplot(
+  usc3_tcells@meta.data, aes(clusters_tcells, decontX_contamination, fill = clusters_tcells)) +
+  geom_boxplot(outlier.size = 0.1) + theme_clean(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  labs(x = NULL, y = "contamination", title = "Contamination by cluster")
+
+
+```
+
+
+```{r tcells_dimreduc_decontX, fig.width=4, fig.height=4, cache=T}
+
+DefaultAssay(usc3_tcells) = "decontX"
+
+tc <- Matrix::colSums(usc3_tcells[["decontX"]]$counts)
+genefreq_batch <- 
+  gene_frequency(usc3_tcells[["decontX"]]$counts, obs = data.table(usc3_tcells@meta.data)[,.(cell_id, sample_id)]
+                 ,cellid_colname = "cell_id"
+                 ,batch_variable = "sample_id")
+
+usc3_tcells = FindVariableFeatures(usc3_tcells, nfeatures = 6215)
+hvgs <- VariableFeatures(usc3_tcells, assay = "RNA")
+
+### Returns a Seurat-style DimReduc object with 
+pcaobj_batch <- 
+  sparse_quasipoisson_pca_seurat_batch(usc3_tcells[["decontX"]]$counts[hvgs,]
+                                       ,totalcounts = tc
+                                       ,grate = genefreq_batch[hvgs,]
+                                       ,obs =data.table(usc3_tcells@meta.data)[,.(cell_id, sample_id)] 
+                                       ,batch_variable = "sample_id"
+                                       ,cellid_colname = "cell_id"
+                                       ,scale.max = 10
+                                       ,do.scale = TRUE
+                                       ,do.center = TRUE,
+                                       ncores = 8)
+#perform UMAP...
+umapobj <- scPearsonPCA::make_umap(pcaobj_batch)
+
+#Integration...
+usc3_tcells[["pearsonpca_decontX"]] <- pcaobj_batch$reduction.data
+usc3_tcells[["pearsonumap_decontX"]] <- umapobj$ump  
+usc3_tcells[["pearsongraph_decontX"]] <- Seurat::as.Graph(umapobj$grph) 
+
+# Clustering
+usc3_tcells <- Seurat::FindClusters(usc3_tcells, resolution = 2, graph = "pearsongraph_decontX", algorithm = 4)
+usc3_tcells@meta.data$clusters_tcells_decontx <- paste0(
+  "G",
+  usc3_tcells@meta.data$pearsongraph_decontX_res.2)
+
+DimPlot(
+  usc3_tcells, 
+  group.by = "sample_id",
+  label = F,
+  label.size = 3,
+  raster = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP Tcells scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc3_tcells, 
+  group.by = "clusters_tcells_decontx",
+  label = T,
+  raster = T,
+  label.size = 3,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP Tcells scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+
+```{r tcells_markers,  fig.width=4, fig.height=9, cache=T}
+
+# Set default reductions
+Idents(usc3_tcells) = usc3_tcells$clusters_tcells_decontx
+
+usc3_tcells <- NormalizeData(
+  usc3_tcells,
+  assay = "RNA",
+  normalization.method = "RC",
+)
+
+markers_decontX <- FindAllMarkers(
+  usc3_tcells,
+  assay           = "RNA",
+  only.pos        = FALSE,
+  min.pct         = 0.01,
+  logfc.threshold = 0.05,
+  test.use        = "wilcox"
+)
+
+markers_reliable <- markers_decontX |>
+  dplyr::filter(
+    p_val_adj < 0.05,
+    abs(avg_log2FC) >= 0.25,
+    abs(pct.1 - pct.2) >= 0.10
+  )
+
+#write tables
+fwrite(markers_decontX, file = "markers_decontX_tcells_despotX.tsv", sep="\t")
+
+
+# top_markers = markers_reliable %>%
+#   group_by(cluster) %>%
+#   slice_head(n=30) %>%
+#   data.table()
+# 
+# # show Heatmap of markers
+# markers.mat = Seurat::AverageExpression(
+#   usc3_tcells,
+#   features = top_markers$gene %>% unique(),
+#   assay = "RNA", slot = "counts"
+# )$RNA %>% data.frame()
+# 
+# pheatmap::pheatmap(markers.mat, scale="row", fontsize_row = 5)
+
+```
+
+
+
+```{r hieratype_tcells,  fig.width=10, fig.height=5, cache=T}
+
+data("markerslist_tcellmajor")
+data(pipeline_tcell)
+
+fct <- clusterwise_foldchange_metrics(counts = usc3_tcells[["decontX"]]$counts[hvgs,],
+                                      ,metadata = usc3_tcells@meta.data,
+                                      ,cluster_column = "clusters_tcells_decontx")
+idxs <- unique(unname(c(unlist(lapply(HieraType::markerslist_cd4tminor, "[[", "index_marker"))
+               ,unlist(lapply(HieraType::markerslist_cd8tminor, "[[", "index_marker")))))
+
+nms <- c("cd4t", names(HieraType::markerslist_cd4tminor), "cd8t", names(HieraType::markerslist_cd8tminor))
+hmsubtype <- marker_heatmap(
+  fct, 
+  featsuse = unique(c("CD8A", "CD8B", "CD4", idxs)), 
+  fold_change_min = 0.05, 
+  cluster_prop_min = 0.05, 
+  topleft_to_bottomright = F) ;print(hmsubtype)
+
+
+```
+
+
+
+
+```{r tcells_annotation, fig.width=8, fig.height=7, cache=T}
+
+usc3_tcells$celltype_tcell <- dplyr::case_when(
+  # confident, multi-gene-coherent calls
+  usc3_tcells$clusters_tcells_decontx == "G3"  ~ "cd8_tem_cytotoxic",   # strongest — all genes in both cd8_tem & cd8_cytotoxic coherent
+  usc3_tcells$clusters_tcells_decontx == "G8"  ~ "cd8_cytotoxic_ifng",  # cd8_cytotoxic coherent; also drives the CXCL9/10/STAT1 signal itself
+  usc3_tcells$clusters_tcells_decontx == "G7"  ~ "cd8_exhausted.1",      # PDCD1/LAG3/TIGIT/HAVCR2/TOX all coherent
+  usc3_tcells$clusters_tcells_decontx == "G4"  ~ "cd4_cd8_tcm.1",      # CCR7/IL7R/SELL coherent — tcm shared signature, lineage not separable
+  usc3_tcells$clusters_tcells_decontx == "G6"  ~ "cd4_cd8_tcm.2",      # same tcm signature, stronger than G4
+
+  # tentative — coherent multi-gene signal, but small clusters (underpowered for significance testing)
+  usc3_tcells$clusters_tcells_decontx == "G13" ~ "cd4_tem",       # n=760, CD44/CCR6/CXCR3/IL7R coherent
+  usc3_tcells$clusters_tcells_decontx == "G2"  ~ "cd4_th2",       # tiny cluster, GATA3/IL4/IL5/CCR4 coherent
+  usc3_tcells$clusters_tcells_decontx == "G14" ~ "cd8_exhausted.2", # n=172, PDCD1/LAG3/HAVCR2/TOX coherent
+
+  # contamination
+  usc3_tcells$clusters_tcells_decontx == "G1"  ~ "Hep.Contaminant.1",  # hepatocyte
+  usc3_tcells$clusters_tcells_decontx == "G9"  ~ "Hep.Contaminant.2",  # hepatocyte + dissociation-stress overlay
+  usc3_tcells$clusters_tcells_decontx == "G12" ~ "Hep.Contaminant.3",  # hepatocyte + dissociation-stress overlay
+  usc3_tcells$clusters_tcells_decontx == "G10" ~ "Fib.Contaminant.4",  # fibroblast
+  usc3_tcells$clusters_tcells_decontx == "G11" ~ "Plasm.Contaminant.5",  # plasma cells (dominant Ig signal; may carry minor T-cell doublet signal)
+
+  # unresolvable — dominated by technical noise despite containing confirmed real T cells (TRAV19/TRAV29DV5)
+  usc3_tcells$clusters_tcells_decontx == "G5"  ~ "Undefined",
+
+  TRUE ~ "Undefined"
+)
+
+celltype_colors_tcell <- c(
+  # CD8 lineage — blue shades (darker = higher confidence)
+  "cd8_tem_cytotoxic"       = "#08306B",  # G3, strongest
+  "cd8_cytotoxic_ifng"      = "#08519C",  # G8
+  "cd8_exhausted.1"           = "#3182BD",  # G7
+  "cd8_exhausted.2" = "#9ECAE1",  # G14, small n
+
+  # CD4 lineage — pink/purple shades
+  "cd4_tem" = "#C994C7",  # G13, small n
+  "cd4_th2"  = "#DE77AE",  # G2, tiny n
+
+  # shared/mixed tcm — green shades
+  "cd4_cd8_tcm.1" = "#41AB5D",  # G4
+  "cd4_cd8_tcm.2" = "#1B7837",  # G6, stronger signal
+
+  # contamination — grayscale
+  "Hep.Contaminant.1" = "#D9D9D9",
+  "Hep.Contaminant.2" = "#BDBDBD",
+  "Hep.Contaminant.3" = "#A3A3A3",
+  "Fib.Contaminant.4" = "#898989",
+  "Plasm.Contaminant.5" = "#6E6E6E",
+
+  "Undefined" = "#000000"
+)
+
+
+DimPlot(
+  usc3_tcells, 
+  group.by = "clusters_tcells_decontx",
+  # cols = celltype_colors,
+  label = T,
+  raster = T,
+  label.size = 3,
+  repel = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+DimPlot(
+  usc3_tcells, 
+  group.by = "celltype_tcell",
+  # cols = celltype_colors,
+  label = T,
+  raster = T,
+  label.size = 3,
+  repel = T,
+  reduction = "pearsonumap_decontX") +
+  theme_clean(base_size = 8) +
+  ggtitle("UMAP — scPearson Batch correction -> decontX applied") +
+  theme(legend.position = "none")
+
+```
+
+
+
+```{r hieratype_ctypes_tcells, fig.width=10, fig.height=5, cache=T}
+
+
+data("markerslist_tcellmajor")
+data(pipeline_tcell)
+
+fct <- clusterwise_foldchange_metrics(counts = usc3_tcells[["decontX"]]$counts[hvgs,],
+                                      ,metadata = usc3_tcells@meta.data,
+                                      ,cluster_column = "celltype_tcell")
+idxs <- unique(unname(c(unlist(lapply(HieraType::markerslist_cd4tminor, "[[", "index_marker"))
+               ,unlist(lapply(HieraType::markerslist_cd8tminor, "[[", "index_marker")))))
+
+nms <- c("cd4t", names(HieraType::markerslist_cd4tminor), "cd8t", names(HieraType::markerslist_cd8tminor))
+hmsubtype <- marker_heatmap(
+  fct, 
+  featsuse = unique(c("CD8A", "CD8B", "CD4", idxs)), 
+  fold_change_min = 0.05, 
+  cluster_prop_min = 0.05, 
+  topleft_to_bottomright = F) ;print(hmsubtype)
+
+
+
+```
+
+
+
+
+
+
+
+
