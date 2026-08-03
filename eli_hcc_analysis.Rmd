@@ -1,0 +1,523 @@
+---
+title: "eli_hcc_tma_spatial"
+author: "elihash"
+date: "2026-07-20"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 7,
+  engine.path = list(bash = "/usr/bin/bash")
+)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+```{r libraries, message=FALSE}
+library(decontX)
+library(AzimuthAPI)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(future)
+library(future.apply)
+library(data.table)
+library(openxlsx)
+library(clustree)
+library(ggthemes)
+library(Polychrome)
+library(scales)
+library(colorspace)
+library(scPearsonPCA)
+library(ggrepel)
+
+source("/home/groups/vcharu/elihash/hcc_project/CosMx_Spatial_transcriptomics/src/custom_functions.R")
+
+# Path on Sherlock for flatfiles
+COSMX_INPUTFILES_REPO <- "/scratch/users/elihash/hcc_tma_project/flatFiles/"
+
+#saving output directory
+output_dir <- "/scratch/users/elihash/hcc_tma_project/output"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+
+PANEL_FOV                    <- "Hs_WTX"
+FOV_MAX_PROP_LOSS            <- 0.6
+
+# QC thresholds
+COUNTS_THRESHOLD_MIN          <- 70
+COUNTS_THRESHOLD_MAX          <- NULL
+AREA_THRESHOLD_MIN            <- NULL
+AREA_THRESHOLD_MAX            <- 35e3
+SBR_THRESHOLD_MIN             <- 0
+SBR_THRESHOLD_MAX             <- 10
+FOV_INTEGRITY_PERCENT_THRESHOLD <- 0.6
+SPLIT_RATIO_THRESHOLD_MIN     <- NULL
+SPLIT_RATIO_THRESHOLD_MAX     <- log2(4)
+
+# Parallelise heavy steps (SCTransform, RCTD, etc.)
+plan("multicore", workers = 6)
+options(future.globals.maxSize = 60 * 1024^3)
+```
+
+###if your session was not open where your env is 
+```{r}
+#directory should show your home
+setwd("/home/groups/vcharu/elihash/hcc_project")
+source("renv/activate.R")
+
+getwd()
+.libPaths()
+
+```
+
+
+## loaading the data from scratch or just load your seurat object
+
+```{r pressure, echo=FALSE}
+HCC <- readCosMx(experiment_repo = COSMX_INPUTFILES_REPO)
+HCC <- readRDS("/scratch/users/elihash/hcc_tma_project/output/hhcc_scperson_decontx_azimuth.rds")
+load("/scratch/users/elihash/hcc_tma_project/output/hcc_progress.RData")
+saveRDS(HCC_qc, file.path(output_dir, "hcc_qc_v1.rds"))
+```
+
+#Let's visualize the TMA slide
+
+
+
+```{r plot_TMA1, fig.height=11}
+# generate and capture the plot
+p <- TmaPlot(HCC_qc, col.by = "FOV", dark = FALSE)
+p                      # this displays it inline in VS Code's Plot viewer (httpgd)
+
+# save it to your output folder with your chosen name
+ggsave(
+  filename = file.path(output_dir, "TMA_plot.png"),
+  plot     = p,
+  width    = 10,
+  height   = 11,
+  dpi      = 300
+)
+```
+
+##My rcode to create the positions for FOVs
+```{r}
+slidename <- "NLS42058_NLTMA332"
+
+fov_pos <- read.csv("/scratch/users/elihash/hcc_tma_project/flatFiles/NLS42058_NLTMA332/NLS42058_NLTMA332_fov_positions_file.csv.gz")
+metadata <- read.csv("/scratch/users/elihash/hcc_tma_project/flatFiles/NLS42058_NLTMA332/NLS42058_NLTMA332_metadata_file.csv.gz")
+
+transcript_summary <- aggregate(nCount_RNA ~ fov, data = metadata, FUN = mean)
+colnames(transcript_summary) <- c("FOV", "mean_transcript")
+
+fov_pos2 <- merge(fov_pos, transcript_summary, by = "FOV", all.x = TRUE)
+
+plot <- ggplot2::ggplot(fov_pos2, ggplot2::aes(x = x_global_px, y = y_global_px, fill = mean_transcript)) +
+  ggplot2::geom_tile(width = 4254*0.00012028, height = 4254*0.00012028) + # CosMx FOVs are 4254x4254 pixels
+  ggplot2::scale_fill_gradient(low = "blue", high = "magenta", limits = range(fov_pos2$mean_transcript, na.rm = TRUE), na.value = "grey80") +
+  ggplot2::coord_fixed() +
+  ggplot2::theme_void() +
+  ggplot2::geom_label(ggplot2::aes(label = FOV)) +
+  ggplot2::labs(title = paste0("Slide: ", slidename))
+
+plot
+
+
+### changing t othe actual mean transcript per FOV
+plot <- ggplot2::ggplot(fov_pos2, ggplot2::aes(x = x_global_px, y = y_global_px, fill = mean_transcript)) +
+  ggplot2::geom_tile(width = 4254, height = 4254) +
+  ggplot2::scale_fill_gradient(low = "blue", high = "magenta", limits = range(fov_pos2$mean_transcript, na.rm = TRUE), na.value = "grey80") +
+  ggplot2::coord_fixed() +
+  ggplot2::theme_void() +
+  ggplot2::geom_label(ggplot2::aes(label = round(mean_transcript, 1)), size = 2.5, colour = "white", fill = NA, linewidth = 0) +
+  ggplot2::labs(title = paste0("Slide: ", slidename))
+
+plot
+ggplot2::ggsave("/scratch/users/elihash/hcc_tma_project/hcc_fov_transcript_map.pdf", 
+                plot, width = 10, height = 14, dpi = 300, limitsize = FALSE)
+
+
+
+
+
+```
+
+
+
+#Now I used gbspatial package for qc 
+```{r qc_controls_and_filtering}
+# Compute per-cell QC metrics
+HCC <- computeFOVintegrity(HCC, max_prop_loss = FOV_MAX_PROP_LOSS, panel_name = PANEL_FOV)
+HCC <- computeSBR(HCC)
+HCC <- computeSplitRatio(HCC)
+HCC$SplitRatioToLocal_log2 <- log2(HCC$SplitRatioToLocal)
+```
+
+Let's visualize the QC plots 
+Potentially can serve for adjusting the default QC parameters...
+
+```{r compute_canonicals_QC_plots}
+
+# Raw QC scatter plots with thresholds
+plots <- plotQCs(
+  HCC,
+  count_min       = COUNTS_THRESHOLD_MIN,
+  count_max       = COUNTS_THRESHOLD_MAX,
+  area_min        = AREA_THRESHOLD_MIN,
+  area_max        = AREA_THRESHOLD_MAX,
+  sbr_min         = SBR_THRESHOLD_MIN,
+  sbr_max         = SBR_THRESHOLD_MAX,
+  split_ratio_min = SPLIT_RATIO_THRESHOLD_MIN,
+  split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX,
+  base_size = 15) %>%
+  patchwork::wrap_plots(nrow = 4)
+
+```
+
+Let's visualize and save the plots...
+
+```{r viz_QCplots, fig.height=12}
+plots
+
+ggsave(
+  filename = file.path(output_dir, "before_filter_plots.png"),
+  plot     = plots,
+  width    = 14,
+  height   = 10,
+  dpi      = 300
+)
+```
+
+
+After adjustments of threshold values ... the filtering can be applied on the Seurat object
+using custom function QCfiltering...
+
+```{r compute_filtering}
+
+# Apply QC filtering
+HCC_qc <- QCfiltering(
+  HCC,
+  count_min               = COUNTS_THRESHOLD_MIN,
+  count_max               = COUNTS_THRESHOLD_MAX,
+  area_min                = AREA_THRESHOLD_MIN,
+  area_max                = AREA_THRESHOLD_MAX,
+  fov_integrity_threshold = FOV_INTEGRITY_PERCENT_THRESHOLD,
+  sbr_min                 = SBR_THRESHOLD_MIN,
+  sbr_max                 = SBR_THRESHOLD_MAX,
+  split_ratio_min         = SPLIT_RATIO_THRESHOLD_MIN,
+  split_ratio_max         = SPLIT_RATIO_THRESHOLD_MAX)
+
+```
+
+Computation and visualization of QC plots following filtering...
+
+```{r compute_QCplots2}
+
+# Post-filter QC scatter plots
+plots_qcs <- plotQCs(
+  HCC_qc,
+  count_min       = COUNTS_THRESHOLD_MIN,
+  count_max       = COUNTS_THRESHOLD_MAX,
+  area_min        = AREA_THRESHOLD_MIN,
+  area_max        = AREA_THRESHOLD_MAX,
+  sbr_min         = SBR_THRESHOLD_MIN,
+  sbr_max         = SBR_THRESHOLD_MAX,
+  split_ratio_min = SPLIT_RATIO_THRESHOLD_MIN,
+  split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX,
+  base_size = 15) %>%
+  patchwork::wrap_plots(nrow = 4)
+```
+
+Visualization after filtering...
+
+```{r viz_QCplots2, fig.height=12}
+plots_qcs
+
+```
+
+
+Summarization_with_upSet_plot
+
+```{r upset_plot_summarization}
+
+# UpSet plot — overlap of filtering flags
+HCC_qc@misc$qc_plots$upset
+
+ggsave(
+  filename = file.path(output_dir, "upset_plot.png"),
+  plot     = HCC_qc@misc$qc_plots$upset,
+  width    = 10,
+  height   = 8,
+  dpi      = 300
+)
+```
+
+
+### 4.2 FOV-to-Core Assignment
+
+Parse the TMA construction-key Excel file, map each FOV to its core grid position, then propagate core identities to individual cells. 
+
+```{r assignation_of_fov_to_cores}
+#To match the TMA map I should have flipped horizontally in this HCC 
+tma_mat <- read.xlsx("/scratch/users/elihash/hcc_tma_project/HCC TMA.xlsx", colNames = FALSE)
+tma_mat <- tma_mat[nrow(tma_mat):1, ]
+  
+  
+# Assign FOVs to TMA cores
+HCC_qc <- assignCoresToCells(HCC_qc,
+  tma_map              = tma_mat,
+  fov_positions        = as.data.frame(fread("/scratch/users/elihash/hcc_tma_project/flatFiles/NLS42058_NLTMA332/NLS42058_NLTMA332_fov_positions_file.csv.gz")),
+  core_drift_tolerance = 0.40)
+
+HCC_qc@misc$fov_core_plots$NLS42058_NLTMA332$Whole_Slide_by_Row
+HCC_qc@misc$fov_core_plots$NLS42058_NLTMA332$Whole_Slide_by_Column
+
+# Manual reassignment: FOV 182 was misassigned — correct to C2R3 / sample 37170
+#HCC_qc$core_str  <- (HCC_qc@meta.data %>% dplyr::mutate(core_str  = ifelse(fov == 182, "C2R3",  core_str)))$core_str
+#HCC_qc$sample_id <- (HCC_qc@meta.data %>% dplyr::mutate(sample_id = ifelse(fov == 182, "37170", sample_id)))$sample_id
+
+# Visualise sample assignments on TMA
+sample_cols <- c(
+  "#E41A1C", "#377EB8", "#4DAF4A", "#FF7F00",
+  "#984EA3", "#A65628", "#F781BF", "#FFED6F",
+  "#00CED1", "#8B0000", "#006400", "#FF6347",
+  "#4B0082", "#2E8B57"
+)
+TmaPlot(HCC_qc, col.by = "sample_id", label = TRUE, dark = TRUE)
+```
+
+------------------------------------------------------------------------
+
+## 5. Dimensionality Reduction
+
+Four embedding strategies are compared to find the best representation for downstream clustering. Batch effects across samples are addressed progressively.
+
+### 5.1 SCTransform — No Batch Correction
+
+Baseline embedding using SCT normalisation, PCA, and UMAP. Exposes any sample-level batch structure.
+
+```{r dimensionality_reduction_noBatch_correction}
+
+requireNamespace("glmGamPoi", quietly = TRUE)
+
+HCC_qc <- SCTransform(
+  HCC_qc,
+  assay           = "RNA",
+  vars.to.regress = c("nCount_RNA", "nFeature_RNA"),
+  clip.range      = c(-10, 10)
+)
+
+HCC_qc <- RunPCA(HCC_qc, npcs = 30, assay = "SCT")
+ElbowPlot(HCC_qc, ndims = 30)
+NPCS <- 20
+
+HCC_qc <- RunUMAP(HCC_qc, dims = 1:NPCS, reduction = "pca")
+UMAP.plot0 <- DimPlot(HCC_qc, group.by = "seurat_clusters", label = TRUE, reduction = "umap") +
+  ggtitle("UMAP — SCT, res 0.5")
+UMAP.plot0
+
+HCC_qc <- FindNeighbors(HCC_qc, dims = 1:20, verbose = FALSE)
+
+##run clustree
+# Define your range of resolutions
+res_range <- seq(0.1, 1.0, by = 0.2)
+
+# Run FindClusters for each resolution
+for (res in res_range) {
+  HCC_qc <- FindClusters(HCC_qc, resolution = res)
+}
+
+clustree(HCC_qc, prefix = "RNA_snn_res.")
+
+HCC_qc <- FindClusters(HCC_qc,resolution = 0.5,  verbose = FALSE)
+p <- DimPlot(HCC_qc, group.by = "sample_id", reduction = "umap", ncol = 1, pt.size = 0.4, label = TRUE, raster = FALSE,
+             cols = hue_pal(l = 55, c = 100)(30)) +
+  ggtitle("UMAP — SCT, By sample_id")
+p
+
+ggplot2::ggsave("/scratch/users/elihash/hcc_tma_project/output/umap_by_sample.pdf", p, width = 24, height = 20, dpi = 300, limitsize = FALSE)
+
+``` 
+
+
+A clear sample-level batch effect is visible in the UMAP.
+
+### 5.2 SCTransform + Harmony Batch Correction
+
+Harmony integration applied on the SCT PCA embedding to correct sample-level batch.
+
+```{r DR_with_harmony_batch_correction}
+tmp_00 <- HCC_qc[["pca"]]
+harmony_embedding1 <- harmony::RunHarmony(
+  HCC_qc[["pca"]]@cell.embeddings,
+  meta_data = HCC_qc@meta.data,
+  vars_use  = "sample_id")
+tmp_00@cell.embeddings  <- harmony_embedding1
+HCC_qc[["pca_harmony"]] <- tmp_00
+
+HCC_qc[["umap_sct_harmony"]] <- (RunUMAP(HCC_qc, reduction = "pca_harmony", dims = 1:NPCS))@reductions$umap
+UMAP.plot1 <- DimPlot(HCC_qc, group.by = "sample_id", label = TRUE, reduction = "umap_sct_harmony", pt.size = 1.5) +
+  ggtitle("UMAP — SCT + Harmony batch correction")
+UMAP.plot1
+```
+
+A residual "globe" artefact in the UMAP suggests SCT normalisation is sub-optimal for this dataset. The quasi-Poisson approach below addresses this.
+
+### 5.3 scPearsonPCA — Native Batch Integration
+
+Quasi-Poisson PCA with built-in per-batch gene-frequency correction. More statistically appropriate for count-based spatial data.
+
+```{r scPearson_approach_with_batch_integration}
+DefaultAssay(HCC_qc) <- "RNA"
+
+tc <- Matrix::colSums(HCC[["RNA"]]$counts)
+hvgs   <- VariableFeatures(HCC_qc)
+
+genefreq_batch <- gene_frequency(
+  HCC_qc[["RNA"]]$counts,
+  obs            = data.table(HCC_qc@meta.data)[, .(cell_ID, sample_id)],
+  cellid_colname = "cell_ID",
+  batch_variable = "sample_id")
+
+tmp_00 <- sparse_quasipoisson_pca_seurat_batch(
+  HCC_qc[["RNA"]]$counts[hvgs, ],
+  totalcounts    = tc,
+  grate          = genefreq_batch[hvgs, ],
+  obs            = data.table(HCC_qc@meta.data)[, .(cell_ID, sample_id)],
+  batch_variable = "sample_id",
+  cellid_colname = "cell_ID",
+  scale.max      = 10,
+  do.scale       = TRUE,
+  do.center      = TRUE)
+
+HCC_qc[["pearson_pca_batch"]] <- tmp_00$reduction.data
+
+tmp_01 <- scPearsonPCA::make_umap(tmp_00)
+HCC_qc[["pearson_umap_batch"]]  <- tmp_01$ump
+HCC_qc[["pearson_graph_batch"]] <- Seurat::as.Graph(tmp_01$grph)
+
+
+HCC <- Seurat::FindClusters(HCC, graph = "pearson_graph_batch", leiden_method = "leidenbase", algorithm = 4, resolution = 0.5)
+HCC@meta.data$pearson_clusters_batch <- HCC@meta.data$seurat_clusters
+umapplotbatch <- scPearsonPCA::plot_umap(umapreduc = "pearson_umap_batch", clustercol = "pearson_clusters_batch", semuse = HCC)
+print(umapplotbatch)
+
+UMAP.plot2 <- DimPlot(HCC_qc, reduction = "pearson_umap_batch", pt.size = 1.5) +
+  ggtitle("UMAP — scPearsonPCA, without harmony")
+UMAP.plot2
+```
+
+### 5.4 scPearsonPCA + Harmony Batch Correction
+
+Quasi-Poisson PCA followed by Harmony correction as an additional comparison.
+
+```{r scPearson_approach_with_harmony_batch_on_pearson_pca}
+DefaultAssay(HCC_qc) <- "RNA"
+
+tc       <- Matrix::colSums(HCC_qc[["RNA"]]$counts)
+genefreq <- scPearsonPCA::gene_frequency(HCC_qc[["RNA"]]$counts)
+
+HCC_qc <- Seurat::FindVariableFeatures(HCC_qc, nfeatures = 2000)
+hvgs   <- VariableFeatures(HCC_qc)
+
+tmp_02 <- sparse_quasipoisson_pca_seurat(
+  HCC_qc[["RNA"]]$counts[hvgs, ],
+  totalcounts = tc,
+  grate       = genefreq[hvgs],
+  scale.max   = 10,
+  do.scale    = TRUE,
+  do.center   = TRUE)
+
+harmony_embedding2 <- harmony::RunHarmony(
+  tmp_02$reduction.data@cell.embeddings,
+  meta_data = HCC_qc@meta.data,
+  vars_use  = "sample_id")
+tmp_02$reduction.data@cell.embeddings <- harmony_embedding2
+
+tmp_03 <- scPearsonPCA::make_umap(tmp_02)
+HCC_qc[["pearson_pca_harmony"]] <- tmp_02$reduction.data
+
+HCC_qc[["pearson_umap_sct_harmony"]] <- (RunUMAP(HCC_qc, reduction = "pearson_pca_harmony", dims = 1:13))@reductions$umap
+UMAP.plot3 <- DimPlot(HCC_qc, group.by = "sample_id", label = TRUE, reduction = "pearson_umap_sct_harmony", pt.size = 1.5) +
+  theme(legend.position = "none") +
+  ggtitle("UMAP — scPearsonPCA + Harmony batch correction")
+UMAP.plot3
+```
+
+#### QC Overlay on Embedding
+
+Inspect whether low-quality cells cluster together in the chosen embedding.
+
+```{r more_on_QC}
+lapply(c("nCount_RNA", "nFeature_RNA"), function(x) {
+  FeaturePlot(HCC_qc, feature = x, order = TRUE, raster = FALSE, assay = "SCT") + ggthemes::theme_clean()
+}) %>% patchwork::wrap_plots(nrow = 2)
+```
+
+------------------------------------------------------------------------
+
+## 6. Clustering & Cell-Type Annotation
+
+### 6.1 Marker Discovery
+
+Find top differentially expressed markers per cluster, then inspect cluster-level average expression with a heatmap.
+
+```{r marker_discovery}
+Idents(HCC_qc) <- HCC_qc$seurat_clusters
+HCC.markers <- data.table(FindAllMarkers(HCC_qc, assay = "SCT", only.pos = TRUE))
+HCC.markers
+
+top5.markers <- (HCC.markers %>% group_by(cluster) %>% slice_head(n = 30)) %>% data.table()
+
+avg.mat <- data.frame(AverageExpression(
+  HCC_qc[top5.markers$gene, ],
+  group.by = "seurat_clusters",
+  layer    = "counts")[["SCT"]])
+pheatmap::pheatmap(avg.mat, scale = "row", display_numbers = TRUE)
+```
+
+### 6.2 Cell-Type Annotation
+
+Project known liver cell-type marker panels onto the UMAP to guide cluster labelling.
+
+```{r feature_plots_cell_types}
+jci_insight_markers <- list(
+  "Kupffer_cells/Macrophages"     = c("C1QC", "C1QB", "C1QA", "MARCO"),
+  "Hepatocytes"                   = c("SLC27A5", "ADH4", "SLC2A2", "ARG1", "CYP4A11"),
+  "HSCs"                          = c("COL1A1", "COL3A1", "DCN", "TAGLN", "SPARC"),
+  "Periportal_hepatocytes"        = c("SAA1", "CRP", "FBP1", "ASS1", "PCK1"),
+  "Epithelial_cells"              = c("KRT18", "PTK2", "SIGMAR1", "VPS29", "MED15"),
+  "Stressed_midzonal_hepatocytes" = c("HAMP", "FOS", "JUND", "SERPINE1", "CXCL2"),
+  "Plasma_cells_1"                = c("IGKC", "IGHG1/2", "JCHAIN", "MZB1", "IGHA1"),
+  "IFN_stressed_hepatocytes"      = c("CXCL9", "CXCL10", "STAT1", "HLA-G", "HLA-F"),
+  "Plasma_cells_2"                = c("IGLC1/2", "IGLL5", "IGKC", "IGHG1/2", "JCHAIN"),
+  "Pericentral_hepatocytes"       = c("GLUL", "TDO2", "FKBP5", "MGST1", "HSD11B1"),
+  "Cholangiocytes"                = c("KRT7", "KRT8", "TACSTD2", "MMP7", "SPP1")
+)
+
+plots <- lapply(names(jci_insight_markers)[1:2], function(x) {
+  message(x)
+  p <- FeaturePlot(HCC_qc, features = jci_insight_markers[[x]], order = TRUE, raster = FALSE, combine = FALSE)
+  p <- lapply(p, function(x) x + theme(legend.position = "none"))
+  patchwork::wrap_plots(p, nrow = 1)
+})
+
+patchwork::wrap_plots(plots, nrow = 2)
+```
