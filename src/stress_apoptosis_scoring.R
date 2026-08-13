@@ -12,7 +12,16 @@
 ## cluster regardless of stress. The leaderboard below is therefore restricted
 ## to clusters whose dominant annotated cell type starts with "Hep".
 ##
-## Usage: Rscript src/stress_apoptosis_scoring.R <path_to_after_despotx_seuratObj.rds> <path_to_celltype_table.tsv> <output_dir>
+## G16 ("Undefined" in celltype_table.tsv, 1214 cells) is force-included in
+## the hepatocyte leaderboard below. Its FindAllMarkers signature (HAMP, A1BG,
+## LDLR, mitochondrial COX1/COX2 alongside MT1A/MT1H/MT1M metallothioneins,
+## SERPINE1, CHI3L1, H2AX, DUSP2) reads as a hepatocyte-derived population
+## whose stress/damage state pushed it off any clean reference celltype match
+## -- exactly the profile that would show up as "Undefined" in an automated
+## annotation built on canonical (unstressed) marker sets, rather than a
+## genuinely distinct lineage.
+##
+## Usage: Rscript src/stress_apoptosis_scoring.R <path_to_after_despotx_seuratObj.rds> <path_to_celltype_table.tsv> <output_dir> [extra_hepatocyte_clusters,comma,separated]
 
 suppressPackageStartupMessages({
   library(Seurat)
@@ -24,6 +33,7 @@ args <- commandArgs(trailingOnly = TRUE)
 obj_path <- if (length(args) >= 1) args[1] else "data/after_despotx_seuratObj.rds"
 celltype_path <- if (length(args) >= 2) args[2] else "celltype_table.tsv"
 out_dir  <- if (length(args) >= 3) args[3] else "results/stress_apoptosis"
+extra_hepatocyte_clusters <- if (length(args) >= 4) strsplit(args[4], ",")[[1]] else "G16"
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
 cluster_col <- "clusters_round3"
@@ -203,8 +213,11 @@ write.table(joint_rank_all %>% arrange(desc(mean_stress)),
 
 hepatocyte_clusters <- joint_rank_all %>%
   filter(startsWith(dominant_celltype, "Hep"), dominant_pct >= 90) %>%
-  pull(cluster)
-message("Hepatocyte clusters used for leaderboard: ", paste(hepatocyte_clusters, collapse = ", "))
+  pull(cluster) %>%
+  as.character() %>%
+  union(extra_hepatocyte_clusters)
+message("Hepatocyte clusters used for leaderboard: ", paste(hepatocyte_clusters, collapse = ", "),
+        " (forced additions: ", paste(extra_hepatocyte_clusters, collapse = ", "), ")")
 
 joint_rank <- joint_rank_all %>%
   filter(cluster %in% hepatocyte_clusters) %>%
