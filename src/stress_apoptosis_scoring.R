@@ -4,7 +4,15 @@
 ## panel, AIH Fas/FasL apoptosis, hepatocyte identity) and pre-filtered to the
 ## TA649 6K Discovery panel.
 ##
-## Usage: Rscript src/stress_apoptosis_scoring.R <path_to_after_despotx_seuratObj.rds> <output_dir>
+## clusters_round3 is ~1 cluster per cell type (per celltype_table.tsv), not
+## hepatocyte subclusters, so cross-cell-type score comparisons are not
+## informative on their own: Hallmark Apoptosis includes ECM/stromal genes
+## (BGN, DCN, LUM, TIMP1-3, MMP2) that read high in any fibroblast, and a
+## generic "hepatocyte identity" score is trivially lowest in any non-hepatocyte
+## cluster regardless of stress. The leaderboard below is therefore restricted
+## to clusters whose dominant annotated cell type starts with "Hep".
+##
+## Usage: Rscript src/stress_apoptosis_scoring.R <path_to_after_despotx_seuratObj.rds> <path_to_celltype_table.tsv> <output_dir>
 
 suppressPackageStartupMessages({
   library(Seurat)
@@ -14,7 +22,8 @@ suppressPackageStartupMessages({
 
 args <- commandArgs(trailingOnly = TRUE)
 obj_path <- if (length(args) >= 1) args[1] else "data/after_despotx_seuratObj.rds"
-out_dir  <- if (length(args) >= 2) args[2] else "results/stress_apoptosis"
+celltype_path <- if (length(args) >= 2) args[2] else "celltype_table.tsv"
+out_dir  <- if (length(args) >= 3) args[3] else "results/stress_apoptosis"
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
 cluster_col <- "clusters_round3"
@@ -72,6 +81,29 @@ message("Loading object: ", obj_path)
 obj <- readRDS(obj_path)
 DefaultAssay(obj) <- "RNA"
 stopifnot(cluster_col %in% colnames(obj@meta.data))
+
+## ---- per-cluster cell-type identity (from independently annotated celltype_table) ----
+
+celltype_df <- read.delim(celltype_path, stringsAsFactors = FALSE)
+stopifnot(all(c("cell_id", "merged_celltypes") %in% colnames(celltype_df)))
+cluster_composition <- obj@meta.data %>%
+  select(cell_id, cluster = all_of(cluster_col)) %>%
+  inner_join(celltype_df, by = "cell_id") %>%
+  count(cluster, merged_celltypes) %>%
+  group_by(cluster) %>%
+  mutate(cluster_n = sum(n)) %>%
+  ungroup()
+
+cluster_celltype <- cluster_composition %>%
+  group_by(cluster) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(cluster, dominant_celltype = merged_celltypes,
+            dominant_pct = round(100 * n / cluster_n, 1))
+
+write.table(cluster_composition %>% arrange(cluster, desc(n)),
+            file.path(out_dir, "cluster_celltype_composition.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
 
 if (!"data" %in% Layers(obj[["RNA"]]) ) {
   message("No normalized 'data' layer found — running NormalizeData (LogNormalize).")
@@ -135,12 +167,18 @@ summary_tbl <- meta %>%
   ) %>%
   arrange(desc(Stress_IEG_HSP__mean))
 
+summary_tbl <- summary_tbl %>%
+  left_join(cluster_celltype, by = "cluster") %>%
+  relocate(dominant_celltype, dominant_pct, .after = cluster)
+
 write.table(summary_tbl, file.path(out_dir, "module_scores_by_cluster.tsv"),
             sep = "\t", row.names = FALSE, quote = FALSE)
 
-## Rank clusters jointly by stress + apoptosis + identity-loss to flag the
-## most plausible "stressed/apoptotic hepatocyte" cluster.
-joint_rank <- meta %>%
+## Rank clusters jointly by stress + apoptosis + identity-loss. This is only
+## meaningful WITHIN hepatocyte clusters (dominant_celltype starts with "Hep"
+## at >=90% purity) -- across cell types it just re-derives "is this a
+## hepatocyte", not "is this hepatocyte stressed".
+joint_rank_all <- meta %>%
   group_by(cluster) %>%
   summarise(
     mean_stress = mean(Stress_IEG_HSP),
@@ -156,48 +194,93 @@ joint_rank <- meta %>%
     n_cells = n(),
     .groups = "drop"
   ) %>%
+  left_join(cluster_celltype, by = "cluster") %>%
+  relocate(dominant_celltype, dominant_pct, .after = cluster)
+
+write.table(joint_rank_all %>% arrange(desc(mean_stress)),
+            file.path(out_dir, "cluster_scores_all_celltypes.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+hepatocyte_clusters <- joint_rank_all %>%
+  filter(startsWith(dominant_celltype, "Hep"), dominant_pct >= 90) %>%
+  pull(cluster)
+message("Hepatocyte clusters used for leaderboard: ", paste(hepatocyte_clusters, collapse = ", "))
+
+joint_rank <- joint_rank_all %>%
+  filter(cluster %in% hepatocyte_clusters) %>%
   mutate(
     stress_rank = rank(-mean_stress),
     apoptosis_rank = rank(-mean_apoptosis_hallmark),
+    apoptosis_core_rank = rank(-mean_apoptosis_core),
     identity_loss_rank = rank(mean_identity),
-    joint_rank_score = stress_rank + apoptosis_rank + identity_loss_rank
+    joint_rank_score = stress_rank + apoptosis_rank + apoptosis_core_rank
   ) %>%
   arrange(joint_rank_score)
 
-write.table(joint_rank, file.path(out_dir, "cluster_joint_ranking.tsv"),
+write.table(joint_rank, file.path(out_dir, "hepatocyte_cluster_ranking.tsv"),
             sep = "\t", row.names = FALSE, quote = FALSE)
 
 ## ---- plots ---------------------------------------------------------------
 
-meta$cluster <- factor(meta$cluster, levels = joint_rank$cluster)
+## (1) all clusters, labeled by dominant cell type, for transparency about
+## what clusters_round3 actually contains.
+celltype_label <- setNames(
+  paste0(cluster_celltype$cluster, ": ", cluster_celltype$dominant_celltype,
+         " (", cluster_celltype$dominant_pct, "%)"),
+  cluster_celltype$cluster
+)
+meta_all <- meta
+meta_all$cluster_label <- factor(celltype_label[as.character(meta_all$cluster)],
+                                  levels = celltype_label[levels(factor(meta_all$cluster))])
 
-vln_data <- meta %>% select(cluster, all_of(score_names), nCount_RNA, nFeature_RNA)
-
-pdf(file.path(out_dir, "module_score_violins.pdf"), width = 11, height = 6)
+pdf(file.path(out_dir, "module_score_violins_all_celltypes.pdf"), width = 13, height = 7)
 for (sn in score_names) {
-  p <- ggplot(vln_data, aes(x = cluster, y = .data[[sn]], fill = cluster)) +
+  p <- ggplot(meta_all, aes(x = cluster_label, y = .data[[sn]], fill = cluster_label)) +
     geom_violin(scale = "width", trim = TRUE) +
     stat_summary(fun = median, geom = "point", size = 1, color = "black") +
     theme_minimal() +
-    theme(legend.position = "none") +
-    labs(title = sn, x = "clusters_round3 (ranked by joint stress/apoptosis/identity-loss)",
-         y = "AddModuleScore")
+    theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = paste0(sn, " (all clusters_round3, by dominant cell type)"),
+         x = NULL, y = "AddModuleScore")
   print(p)
 }
 dev.off()
 
-## Heatmap of mean module score (z-scored across clusters) per signature.
+## (2) hepatocyte-only leaderboard, ranked by joint_rank_score.
+meta_hep <- meta %>% filter(cluster %in% hepatocyte_clusters)
+meta_hep$cluster <- factor(meta_hep$cluster, levels = joint_rank$cluster)
+
+pdf(file.path(out_dir, "module_score_violins_hepatocytes_only.pdf"), width = 9, height = 6)
+for (sn in score_names) {
+  p <- ggplot(meta_hep, aes(x = cluster, y = .data[[sn]], fill = cluster)) +
+    geom_violin(scale = "width", trim = TRUE) +
+    stat_summary(fun = median, geom = "point", size = 1, color = "black") +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(title = paste0(sn, " (hepatocyte clusters only, ranked by joint stress+apoptosis score)"),
+         x = "clusters_round3", y = "AddModuleScore")
+  print(p)
+}
+dev.off()
+
+## Heatmap of mean module score (z-scored across the hepatocyte clusters only).
 score_mat <- as.matrix(joint_rank[, c("mean_stress","mean_apoptosis_hallmark",
                                        "mean_apoptosis_core","mean_fas_fasl",
                                        "mean_upr","mean_oxidative","mean_p53",
                                        "mean_identity")])
-rownames(score_mat) <- joint_rank$cluster
+rownames(score_mat) <- paste0(joint_rank$cluster, " (", joint_rank$dominant_celltype, ")")
 z_mat <- scale(score_mat)
 
-pdf(file.path(out_dir, "module_score_heatmap.pdf"), width = 8, height = 6)
-heatmap(z_mat, Colv = NA, scale = "none", margins = c(10, 6),
-        main = "Mean module score (z-scored across clusters)")
+pdf(file.path(out_dir, "module_score_heatmap_hepatocytes_only.pdf"), width = 9, height = 6)
+heatmap(z_mat, Colv = NA, scale = "none", margins = c(10, 14),
+        main = "Mean module score (z-scored across hepatocyte clusters)")
 dev.off()
 
 message("Done. Outputs written to: ", normalizePath(out_dir))
-print(joint_rank)
+cat("\n--- Hepatocyte-cluster leaderboard (stress + apoptosis) ---\n")
+print(joint_rank %>% select(cluster, dominant_celltype, dominant_pct, mean_stress,
+                             mean_apoptosis_hallmark, mean_apoptosis_core, mean_identity,
+                             joint_rank_score))
+cat("\n--- All clusters, for context (cell type composition) ---\n")
+print(joint_rank_all %>% select(cluster, dominant_celltype, dominant_pct, n_cells) %>%
+        arrange(cluster))
