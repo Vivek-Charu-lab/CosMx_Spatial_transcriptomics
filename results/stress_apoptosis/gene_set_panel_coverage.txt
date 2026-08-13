@@ -1,0 +1,9 @@
+Stress_IEG_HSP               present=21/21
+Apoptosis_Hallmark           present=135/161
+  missing:  AIFM3, BCL2L10, BIK, BMF, BTG3, CASP2, CASP6, CTH, DAP, DAP3, EGR3, FDXR, GSTM1, GUCY2D, H1F0, IFITM3, LPPR4, MADD, NEDD9, NEFH, PEA15, RETSAT, RHOT2, RNASEL, SC5DL, SLC20A1 
+Apoptosis_Core_Mechanistic   present=20/20
+Fas_FasL_AIH                 present=5/5
+UPR_Core                     present=11/11
+Oxidative_Stress_Core        present=14/14
+P53_Senescence_Core          present=7/7
+Hepatocyte_Identity          present=7/7
