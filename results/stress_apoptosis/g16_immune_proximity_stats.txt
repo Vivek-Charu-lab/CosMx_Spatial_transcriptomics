@@ -1,0 +1,37 @@
+Distance to nearest immune cell (mm), by cluster:
+# A tibble: 6 × 5
+  clusters_round3 n_cells median_dist mean_dist pct_within_50um
+  <fct>             <int>       <dbl>     <dbl>           <dbl>
+1 G12                3420      0.0153    0.0182            97.9
+2 G8                 7370      0.0157    0.0186            98.2
+3 G16                1214      0.0174    0.0199            97.2
+4 G3                14716      0.0185    0.0213            97.3
+5 G1                18099      0.0192    0.0226            95.7
+6 G4                12063      0.0216    0.0257            92.8
+
+Wilcoxon rank-sum test, G16 vs healthy zonal hepatocytes (G1+G3+G4):
+
+	Wilcoxon rank sum test with continuity correction
+
+data:  g16_d and healthy_d
+W = 23089812, p-value < 2.2e-16
+alternative hypothesis: true location shift is not equal to 0
+
+
+Wilcoxon rank-sum test, G16 vs G8 (Hep.IFNg):
+
+	Wilcoxon rank sum test with continuity correction
+
+data:  g16_d and g8_d
+W = 4718666, p-value = 0.00219
+alternative hypothesis: true location shift is not equal to 0
+
+
+Wilcoxon rank-sum test, G16 vs G12 (Hep.Proliferating):
+
+	Wilcoxon rank sum test with continuity correction
+
+data:  g16_d and g12_d
+W = 2265299, p-value = 2.261e-06
+alternative hypothesis: true location shift is not equal to 0
+
