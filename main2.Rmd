@@ -1,0 +1,939 @@
+---
+title: "CosMx → Celldega Landscape — TA649"
+author: "F. Ake"
+date: "2026-09-08"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options:
+  chunk_output_type: inline
+---
+
+[Celldega](https://github.com/broadinstitute/celldega) is the Broad's spatial-omics viewer: a Python
+pre-processing side (`celldega.pre`) that bakes a dataset into a tiled, web-native
+**LandscapeFiles / DegaFiles** directory, and a JS/deck.gl widget (`celldega.viz.Landscape`) that
+streams those tiles into Jupyter, VS Code or a browser. It renders every cell and every transcript
+of TA649 at once, over the morphology image — which is the thing Seurat's `ImageDimPlot()` cannot do.
+
+**Celldega has no CosMx reader.** `celldega.pre` supports Xenium, MERSCOPE, Visium HD and a
+half-finished `"custom"` path. The route the Celldega authors themselves take for CosMx
+(`notebooks/CosMx_pre-process.ipynb` in their repo) is to *rewrite the CosMx flat files into the
+Xenium file layout* and then drive the ordinary Xenium pipeline with `technology="Xenium"`. That is
+what this document does. The `"custom"` path is deliberately avoided: it has no transcript
+row-group support, expects a GeoParquet the flat files do not provide, and is less exercised.
+
+Everything heavy here is Python, so the chunks below are `{python}` chunks executed through
+`reticulate` against a dedicated venv — same pattern as the scCODA section of `main.Rmd`, for the
+same reason (celldega's dependency stack, `pyvips`/`polars`/`pyarrow`, does not belong in the group
+R conda env). R chunks are used only for configuration and for exporting annotations out of the
+Seurat object.
+
+**Where to run it.** §3–§6 are the build: they stream a 2.6 GB tx file, stitch 182 morphology TIFFs
+and write tens of thousands of tiles, so per lab policy they belong in a batch job, not on a login
+node. §8–§9 are the viewer and need an interactive kernel. The split works cleanly:
+
+```bash
+# build once (RStudio-Server on Slurm, or knit the first six sections headless)
+sbatch -p bhowitt --qos=high_p --time=12:00:00 --cpus-per-task=8 --mem=128GB \
+  --wrap="Rscript -e \"rmarkdown::render('main2.Rmd')\""
+# then attach the widget from a notebook against the DegaFiles the job left behind
+```
+
+Once `DEGA/` exists, §8 is cheap — reopening the Landscape re-runs nothing.
+
+## 1. Libraries & Configuration
+#### =====================================================================================================
+
+```{r setup, include=FALSE, cache=F, message=FALSE, warning=FALSE}
+
+# 1. Global variables
+COSMX_INPUTFILES_REPO = "~/Projects/CosMx_Spatial_transcriptomics/"
+SLIDE                 = "TA649"
+SEURAT_SAVEPOINT      = paste0(COSMX_INPUTFILES_REPO, "usc2_savepoint.RDS")
+
+# 2. Global chunk options. cache=F throughout: every expensive step below writes a file and
+#    skips itself when that file already exists, which is a more honest checkpoint than knitr's
+#    cache for multi-GB artefacts that must survive a session restart.
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = TRUE,
+  cache   = FALSE,
+  fig.width = 12,
+  fig.height = 8
+)
+
+# 3. Load libraries
+invisible(
+  lapply(
+    c("Seurat", "data.table", "reticulate"),
+    function(x) { library(x, quietly = T, character.only = T) }
+  )
+)
+```
+
+The venv is built once and reused. `pyvips` needs the libvips **shared library**, which pip cannot
+supply — on Sherlock use `ml load system vips` (or `conda install -c conda-forge pyvips libvips`);
+on macOS `brew install vips`. Everything else is a wheel.
+
+```{r py_env, cache=F}
+
+# 1. Point reticulate at an isolated celldega venv BEFORE importing anything.
+#    Honour $CELLDEGA_PYTHON if the env already exists elsewhere (e.g. a Sherlock micromamba env),
+#    otherwise build a local venv. Same escape hatch as $COSMX_PYTHON in src/custom_funct.R.
+celldega_python = Sys.getenv("CELLDEGA_PYTHON", unset = NA)
+
+if (!is.na(celldega_python)) {
+  use_python(celldega_python, required = TRUE)
+} else {
+  venv_path = file.path(path.expand(COSMX_INPUTFILES_REPO), ".venv_celldega")
+  if (!dir.exists(venv_path)) {
+    reticulate::virtualenv_create(venv_path, python = "3.11")
+    reticulate::py_install(
+      c("celldega", "pyarrow", "polars", "scipy", "scanpy", "anndata",
+        "geopandas", "shapely", "tifffile", "imagecodecs", "pyvips"),
+      envname = venv_path, pip = TRUE
+    )
+  }
+  use_virtualenv(venv_path, required = TRUE)
+}
+
+# 2. Fail loudly rather than half-importing: a missing libvips only surfaces at dzsave time,
+#    which is ~40 min into the run.
+py_run_string("import celldega, pyvips, polars, pyarrow, tifffile; print('celldega', celldega.__version__)")
+```
+
+```{python py_config}
+
+# 1. Paths. FLAT / DECODED are the AtoMx and instrument exports; XEN is the Xenium-shaped
+#    intermediate we synthesise; DEGA is what the Landscape widget actually reads.
+from pathlib import Path
+import os
+import celldega as dega
+
+REPO    = Path(os.path.expanduser(r.COSMX_INPUTFILES_REPO))
+SLIDE   = r.SLIDE
+FLAT    = REPO / "data" / f"{SLIDE}_export" / "flatFiles" / SLIDE
+DECODED = REPO / "data" / f"{SLIDE}_export" / "DecodedFiles" / SLIDE / "20260110_014400_S1"
+MORPH   = DECODED / "CellStatsDir" / "Morphology2D"
+
+XEN  = REPO / "data" / "celldega" / f"{SLIDE}_xenium"   # Xenium-format intermediates
+DEGA = REPO / "data" / "celldega" / f"{SLIDE}_dega"     # DegaFiles consumed by the widget
+for p in (XEN, DEGA):
+    p.mkdir(parents=True, exist_ok=True)
+
+# 2. Acquisition constants (RunSummary/*_ExptConfig.txt, and the run's fixed tile size).
+FOV_PX     = 4256              # ImRows / ImCols
+PX_UM      = 0.120280945       # ImPixel_nm / 1000
+
+# 3. Landscape knobs.
+#    DOWNSAMPLE sets the resolution of the stitched morphology mosaic AND the coordinate scale
+#    written into the affine, so cells/transcripts/image stay locked together by construction.
+#    The full-resolution mosaic is ~94k x 131k px = 12.3 Gpx per channel; 4 gives 0.48 um/px and a
+#    771 Mpx mosaic, which is plenty for a whole-TMA overview and fits in a laptop's RAM as uint8.
+DOWNSAMPLE  = 4
+COORD_SCALE = 1.0 / DOWNSAMPLE
+TILE_SIZE   = 250              # fine tile size, in mosaic px, for transcript / boundary tiles
+MAX_WORKERS = 8
+
+# 4. Morphology channel order. The TIFFs are 5-plane; the plane order is the ChannelID order
+#    B,G,Y,R,U from RunSummary/Morphology_ChannelID_Dictionary.txt.
+#    (plane, dega_name, button_label, rgb)
+CHANNELS = [
+    (4, "dapi",     "DNA",      [0,   0,   255]),
+    (0, "panck",    "PanCK",    [0,   255, 0  ]),
+    (2, "membrane", "Membrane", [255, 0,   255]),
+    (3, "cd45",     "CD45",     [255, 255, 0  ]),
+]
+IMAGE_INFO = [{"name": n, "button_name": b, "color": c} for (_, n, b, c) in CHANNELS]
+
+print("FLAT   ", FLAT)
+print("MORPH  ", MORPH, "-", len(list(MORPH.glob("*.TIF"))), "FOV TIFFs")
+print("DEGA   ", DEGA)
+```
+
+## 2. The coordinate contract
+#### =====================================================================================================
+
+Celldega keeps cells, transcripts and image pixels in one **image-pixel** frame, and gets there by
+applying a single 3×3 affine (`micron_to_image_transform.csv`) to the vendor's coordinates. So the
+whole visualisation rests on one question: *what affine maps CosMx `*_global_px` onto the row/col of
+the stitched morphology mosaic?* Guessing it wrong produces a Landscape where cells float next to
+their nuclei, which is easy to miss and impossible to interpret.
+
+For TA649 the relation is exact rather than approximate. Checked against
+`TA649_fov_positions_file.csv.gz` over all 182 FOVs and all 126,740 rows of the metadata file, with
+**zero** residual (not a fit — an identity):
+
+$$x_{global} = x_{fov} + x_{local} \qquad y_{global} = y_{fov} - y_{local}$$
+
+So `y_local` counts *away* from the FOV's `y_global_px` reference line, and each FOV occupies
+`y_global ∈ (y_fov − 4256, y_fov]`. Placing tile row `r = y_local` at mosaic row
+`(Y_max − y_fov) + r` therefore lays every FOV down consistently, giving the FOV-independent affine
+
+$$col = (x_{global} - X_{min})\cdot s \qquad row = (Y_{max} - y_{global})\cdot s$$
+
+with `s = 1/DOWNSAMPLE`, i.e. the matrix `[[s,0,-X_min·s],[0,-s,Y_max·s],[0,0,1]]`.
+
+The one bit this does **not** pin down is whether raw TIFF row `r` equals `y_local` (top-down) or
+`4255 − y_local` (bottom-up) — the vendor documents neither, and the Minerva stitcher in the sibling
+`LiverCosMX/` workspace assumes bottom-up (it flips each tile, then inverts Y globally, which
+composes back to the same net orientation). Chunk 2b settles it directly against DAPI signal instead
+of inheriting the assumption.
+
+```{python coord_contract}
+
+# 1. Verify the local -> global relation exactly, over every cell. This is an assertion, not a fit:
+#    if AtoMx ever changes the convention the run stops here rather than producing a subtly
+#    misregistered Landscape.
+import polars as pl
+import numpy as np
+
+fov_pos = pl.read_csv(FLAT / f"{SLIDE}_fov_positions_file.csv.gz").select(
+    pl.col("FOV").cast(pl.Int32).alias("fov"),
+    pl.col("x_global_px").cast(pl.Float64).alias("x_fov"),
+    pl.col("y_global_px").cast(pl.Float64).alias("y_fov"),
+)
+
+meta = pl.read_csv(
+    FLAT / f"{SLIDE}_metadata_file.csv.gz",
+    columns=["fov", "cell_id", "CenterX_local_px", "CenterY_local_px",
+             "CenterX_global_px", "CenterY_global_px"],
+).with_columns(pl.col("fov").cast(pl.Int32)).join(fov_pos, on="fov", how="left")
+
+res_x = (meta["CenterX_global_px"] - (meta["x_fov"] + meta["CenterX_local_px"])).abs().max()
+res_y = (meta["CenterY_global_px"] - (meta["y_fov"] - meta["CenterY_local_px"])).abs().max()
+print(f"cells {meta.height:,}   max|x residual| = {res_x}   max|y residual| = {res_y}")
+assert res_x == 0 and res_y == 0, "local->global convention changed; re-derive the affine"
+
+# 2. Mosaic geometry and the affine that follows from it.
+X_MIN = float(fov_pos["x_fov"].min())
+Y_MAX = float(fov_pos["y_fov"].max())
+MOSAIC_W_FULL = int(fov_pos["x_fov"].max() - X_MIN) + FOV_PX
+MOSAIC_H_FULL = int(Y_MAX - fov_pos["y_fov"].min()) + FOV_PX
+MOSAIC_W = int(np.ceil(MOSAIC_W_FULL / DOWNSAMPLE))
+MOSAIC_H = int(np.ceil(MOSAIC_H_FULL / DOWNSAMPLE))
+
+AFFINE = np.array([
+    [ COORD_SCALE, 0.0,          -X_MIN * COORD_SCALE],
+    [ 0.0,        -COORD_SCALE,   Y_MAX * COORD_SCALE],
+    [ 0.0,         0.0,           1.0                ],
+])
+print(f"mosaic full {MOSAIC_W_FULL} x {MOSAIC_H_FULL} px -> /{DOWNSAMPLE} = {MOSAIC_W} x {MOSAIC_H}")
+print(f"resolution  {PX_UM * DOWNSAMPLE:.3f} um/px")
+print(AFFINE)
+```
+
+```{python orientation_check}
+
+# 1. Decide TIFF row orientation empirically: bin cell centroids and the DAPI plane onto the same
+#    coarse grid per FOV and correlate, once with y_local read as a top-down row and once bottom-up.
+#    Whichever wins is the truth for this run.
+import tifffile
+
+def _corr(a, b):
+    a = a.ravel() - a.mean(); b = b.ravel() - b.mean()
+    return float((a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum() + 1e-12))
+
+DAPI_PLANE = CHANNELS[0][0]
+B = 64                                       # bin edge, px -> 66 x 66 grid per FOV
+probe_fovs = [1, 20, 45, 77, 100, 130, 160]
+score = {"topdown": 0.0, "bottomup": 0.0}
+
+for fv in probe_fovs:
+    tif = next(MORPH.glob(f"*_F{fv:05d}.TIF"), None)
+    if tif is None:
+        continue
+    dapi = tifffile.imread(tif)[DAPI_PLANE].astype(np.float32)
+    n    = FOV_PX // B
+    img  = dapi[:n*B, :n*B].reshape(n, B, n, B).mean(axis=(1, 3))
+
+    pts = meta.filter(pl.col("fov") == fv).select("CenterX_local_px", "CenterY_local_px").to_numpy()
+    if len(pts) < 50:
+        continue
+    dens = np.zeros((n, n), np.float32)
+    np.add.at(dens,
+              (np.clip((pts[:, 1] // B).astype(int), 0, n-1),
+               np.clip((pts[:, 0] // B).astype(int), 0, n-1)), 1.0)
+
+    score["topdown"]  += _corr(dens,       img)
+    score["bottomup"] += _corr(dens[::-1], img)
+
+FLIP_TILE = score["bottomup"] > score["topdown"]
+print(f"summed density-vs-DAPI correlation: top-down {score['topdown']:.2f}  "
+      f"bottom-up {score['bottomup']:.2f}")
+print(f"-> y_local is {'BOTTOM-UP (flip each tile)' if FLIP_TILE else 'TOP-DOWN (no flip)'}")
+assert max(score.values()) > 1.0, "no orientation correlates with DAPI - check the channel map"
+```
+
+On the TA649 export this comes out decisively **top-down** (summed r ≈ 3.7 vs ≈ 0.0 across seven
+FOVs): the raw TIFF row *is* `y_local`, and no per-tile flip is needed. The `FLIP_TILE` flag is
+carried through to the stitcher anyway so a re-export with the other convention still works.
+
+## 3. Flat files → Xenium-format intermediates
+#### =====================================================================================================
+
+Four artefacts, written into `XEN/`, are what the Xenium pipeline reads:
+
+| Xenium file | built from | columns |
+|---|---|---|
+| `cells.csv.gz` | `*_metadata_file.csv.gz` | `cell_id, x_centroid, y_centroid` |
+| `cell_boundaries.parquet` | `*-polygons.csv.gz` | `cell_id, vertex_x, vertex_y` |
+| `cell_feature_matrix/` | `*_exprMat_file.csv.gz` | 10x MTX triplet, genes × cells |
+| `transcripts.parquet` | `*_tx_file.csv.gz` | `cell_id, transcript_id, feature_name, x_location, y_location` |
+
+Coordinates stay in raw `global_px` here; the affine from §2 is applied later by celldega itself.
+
+**Control features.** The Celldega CosMx notebook drops everything matching `Negative*` /
+`SystemControl*`. On this panel that also swallows `NegativeAdd`, which `plex-6atoipi5h2.txt`
+classes as *Endogenous* and which NanoString's own `nCount_RNA` counts as RNA — the same quirk
+documented in `CLAUDE.md` for `readCosMxAnnData()`. Here we follow the vendor: drop
+`^Negative[0-9]+$` (20) and `^SystemControl` (323), keep `NegativeAdd`, leaving **6216** genes.
+
+### a. Cell centroids and polygons
+
+```{python xen_cells}
+
+# 1. cells.csv.gz  <- metadata centroids. Xenium's reader wants exactly these three columns.
+#    polars' write_csv does NOT compress based on the file extension - it would leave a plain CSV
+#    called .gz, which pandas then tries to gunzip and dies on. Write through gzip explicitly.
+import gzip
+
+cells_csv = XEN / "cells.csv.gz"
+if not cells_csv.exists():
+    cells = meta.select(
+        pl.col("cell_id"),
+        pl.col("CenterX_global_px").alias("x_centroid"),
+        pl.col("CenterY_global_px").alias("y_centroid"),
+    )
+    with gzip.open(cells_csv, "wb") as fh:
+        cells.write_csv(fh)
+print("cells.csv.gz", cells_csv.stat().st_size // 1024, "KB",
+      "(gzip magic:", open(cells_csv, "rb").read(2) == b"\x1f\x8b", ")")
+
+# 2. cell_boundaries.parquet <- polygon vertices, used as-is.
+#    The Celldega CosMx notebook re-centres every polygon onto its metadata centroid, because on
+#    their WTx colon sample the polygon positions were spread ~2x within each FOV. That is NOT true
+#    here: measured over all 126,740 cells the polygon vertex-mean sits -0.1 +/- 11.8 px from the
+#    metadata centroid in x and -0.8 +/- 11.8 px in y (~1.4 um, the ordinary vertex-mean-vs-centroid
+#    difference), with slope 1.00. Re-centring would be a no-op at best and would discard the
+#    vendor's own centroid at worst, so polygons pass through and the property is asserted instead.
+bounds_pq = XEN / "cell_boundaries.parquet"
+if not bounds_pq.exists():
+    poly = pl.read_csv(
+        FLAT / f"{SLIDE}-polygons.csv.gz",
+        columns=["cell", "x_global_px", "y_global_px"],
+        schema_overrides={"x_global_px": pl.Float64, "y_global_px": pl.Float64},
+    ).rename({"cell": "cell_id", "x_global_px": "vertex_x", "y_global_px": "vertex_y"})
+
+    # shapely's LinearRing needs >= 4 coordinates; drop degenerate outlines
+    keep = poly.group_by("cell_id").len().filter(pl.col("len") >= 4).select("cell_id")
+    poly = poly.join(keep, on="cell_id", how="inner")
+
+    chk = (poly.group_by("cell_id")
+               .agg(pl.col("vertex_x").mean().alias("px"), pl.col("vertex_y").mean().alias("py"))
+               .join(meta.select(pl.col("cell_id"),
+                                 pl.col("CenterX_global_px").alias("mx"),
+                                 pl.col("CenterY_global_px").alias("my")),
+                     on="cell_id", how="inner"))
+    dx = (chk["px"] - chk["mx"]).to_numpy(); dy = (chk["py"] - chk["my"]).to_numpy()
+    print(f"polygon centroid - metadata centroid: dx {dx.mean():+.1f} +/- {dx.std():.1f} px, "
+          f"dy {dy.mean():+.1f} +/- {dy.std():.1f} px  (n={len(dx):,})")
+    assert abs(dx.mean()) < 50 and abs(dy.mean()) < 50, \
+        "polygons are offset from centroids - re-centre them (see Celldega CosMx notebook)"
+
+    poly.write_parquet(bounds_pq)
+    print(f"{poly.height:,} vertices, {chk.height:,} cells -> {bounds_pq.name}")
+else:
+    print("cell_boundaries.parquet exists, skipping")
+```
+
+### b. Expression matrix → 10x MTX
+
+`read_cbg_mtx()` expects the 10x triplet (`matrix.mtx.gz` genes × cells, `barcodes.tsv.gz`,
+`features.tsv.gz`). The exprMat CSV is 142 MB gzipped / 6561 columns wide, so it is parsed with
+pyarrow batch-by-batch rather than pandas. Cell barcodes are rebuilt as `c_<slide>_<fov>_<cell_ID>`
+to match `cell_id` in the metadata.
+
+```{python xen_cbg}
+
+# 1. Stream the exprMat, keeping only vendor-endogenous columns.
+import gzip, re, shutil, time
+import pyarrow as pa, pyarrow.csv as pacsv
+import scipy.sparse as sp
+from scipy.io import mmwrite
+
+CBG_DIR = XEN / "cell_feature_matrix"
+NEG_RE  = re.compile(r"^Negative[0-9]+$")
+
+if not (CBG_DIR / "matrix.mtx.gz").exists():
+    CBG_DIR.mkdir(parents=True, exist_ok=True)
+    with gzip.open(FLAT / f"{SLIDE}_exprMat_file.csv.gz", "rt") as f:
+        header = f.readline().strip().split(",")
+    genes = [g for g in header[2:]
+             if not NEG_RE.match(g) and not g.startswith("SystemControl")]
+    print(f"kept {len(genes)} endogenous of {len(header)-2} features "
+          f"(NegativeAdd kept: {'NegativeAdd' in genes})")
+
+    col_types = {"fov": pa.int32(), "cell_ID": pa.int64()}
+    col_types.update({g: pa.int32() for g in genes})
+    reader = pacsv.open_csv(
+        FLAT / f"{SLIDE}_exprMat_file.csv.gz",
+        read_options=pacsv.ReadOptions(block_size=128 << 20),
+        convert_options=pacsv.ConvertOptions(include_columns=["fov", "cell_ID"] + genes,
+                                             column_types=col_types),
+    )
+
+    slide_no = 1                                  # cell_id is c_<slide>_<fov>_<cell_ID>
+    barcodes, blocks, t = [], [], time.time()
+    for batch in reader:
+        fov = batch.column("fov").to_numpy()
+        cid = batch.column("cell_ID").to_numpy()
+        barcodes.extend(f"c_{slide_no}_{f}_{c}" for f, c in zip(fov, cid))
+        mat = np.empty((batch.num_rows, len(genes)), dtype=np.int32)
+        for j, g in enumerate(genes):
+            mat[:, j] = batch.column(g).to_numpy(zero_copy_only=False)
+        blocks.append(sp.csr_matrix(mat))
+    cbg_mat = sp.vstack(blocks).tocsr()
+    print(f"cbg {cbg_mat.shape} nnz {cbg_mat.nnz:,}  ({time.time()-t:.0f}s)")
+
+    # 2. Write the triplet. mmwrite wants genes x cells.
+    with gzip.open(CBG_DIR / "barcodes.tsv.gz", "wt") as f:
+        f.write("\n".join(barcodes) + "\n")
+    with gzip.open(CBG_DIR / "features.tsv.gz", "wt") as f:
+        f.write("\n".join(f"{g}\t{g}\tGene Expression" for g in genes) + "\n")
+    mtx = CBG_DIR / "matrix.mtx"
+    mmwrite(str(mtx), cbg_mat.T.tocoo(), field="integer")
+    with open(mtx, "rb") as fi, gzip.open(str(mtx) + ".gz", "wb") as fo:
+        shutil.copyfileobj(fi, fo, length=16 << 20)
+    mtx.unlink()
+    del blocks, cbg_mat
+else:
+    print("cell_feature_matrix/ exists, skipping")
+```
+
+### c. Transcripts
+
+The tx file is 2.6 GB gzipped and never fits in memory — `CLAUDE.md` is explicit about this. pyarrow
+streams it and writes large row groups, which the tiler in §6 then reads back in bounded memory.
+Transcripts with `cell = c_<slide>_<fov>_0` are extracellular; they are kept, because seeing
+unassigned transcripts is half the point of looking at a Landscape.
+
+```{python xen_trx}
+
+# 1. Stream tx -> Xenium transcripts.parquet, dropping the same control targets as the CBG.
+import pyarrow.compute as pc, pyarrow.parquet as pq
+
+trx_pq = XEN / "transcripts.parquet"
+if not trx_pq.exists():
+    out_schema = pa.schema([("cell_id", pa.string()), ("transcript_id", pa.int64()),
+                            ("feature_name", pa.string()),
+                            ("x_location", pa.float64()), ("y_location", pa.float64())])
+    reader = pacsv.open_csv(
+        FLAT / f"{SLIDE}_tx_file.csv.gz",
+        read_options=pacsv.ReadOptions(block_size=256 << 20),
+        convert_options=pacsv.ConvertOptions(
+            include_columns=["cell", "target", "x_global_px", "y_global_px"],
+            column_types={"x_global_px": pa.float64(), "y_global_px": pa.float64()}),
+    )
+    writer, tid, nrows, t = pq.ParquetWriter(trx_pq, out_schema, compression="zstd"), 0, 0, time.time()
+    for i, batch in enumerate(reader):
+        tgt  = batch.column("target")
+        # pyarrow has no regex match_substring for ^Negative[0-9]+$ cheaply; match_substring_regex does
+        keep = pc.invert(pc.or_(pc.match_substring_regex(tgt, r"^Negative[0-9]+$"),
+                                pc.starts_with(tgt, "SystemControl")))
+        b = batch.filter(keep)
+        if b.num_rows == 0:
+            continue
+        writer.write_batch(pa.record_batch(
+            [b.column("cell"),
+             pa.array(range(tid, tid + b.num_rows), type=pa.int64()),
+             b.column("target"), b.column("x_global_px"), b.column("y_global_px")],
+            schema=out_schema))
+        tid += b.num_rows; nrows += b.num_rows
+        if i % 50 == 0:
+            print(f"  {nrows:,} rows  {time.time()-t:.0f}s", flush=True)
+    writer.close()
+    print(f"DONE {nrows:,} transcripts -> {trx_pq.name}  ({time.time()-t:.0f}s)")
+else:
+    print("transcripts.parquet exists, skipping")
+```
+
+## 4. Annotations from the Seurat savepoint
+#### =====================================================================================================
+
+Leiden-on-the-spot would throw away the whole `main.Rmd` pipeline. Instead the labels that took the
+work — DeSpotX-decontaminated cell types, the TMA core / donor assignment from `parseTMAmap()` —
+are exported and handed to Celldega as the cell clusterings. `celltype_despotx` becomes the
+*default* colouring (Celldega's Xenium path reads
+`analysis/clustering/gene_expression_graphclust/clusters.csv`); the rest are attached in §7 as
+additional selectable clusterings.
+
+```{r export_annotations, cache=F}
+
+# 1. Pull only the metadata columns; the object itself is 600 MB and nothing else is needed here.
+usc2 = readRDS(SEURAT_SAVEPOINT)
+md   = as.data.table(usc2@meta.data, keep.rownames = "cell_id")
+
+# 2. Take whichever annotation columns this savepoint actually carries, in preference order for
+#    the default. main.Rmd has produced celltype_despotx and merged_celltypes at different stages.
+ANNOT_COLS = intersect(
+  c("celltype_despotx", "merged_celltypes", "sample_id", "core_str", "fov", "seurat_clusters"),
+  colnames(md)
+)
+DEFAULT_ANNOT = ANNOT_COLS[1]
+message("exporting annotations: ", paste(ANNOT_COLS, collapse = ", "),
+        "  |  default = ", DEFAULT_ANNOT)
+
+annot = md[, c("cell_id", ANNOT_COLS), with = FALSE]
+annot[, (ANNOT_COLS) := lapply(.SD, as.character), .SDcols = ANNOT_COLS]
+
+annot_dir = file.path(path.expand(COSMX_INPUTFILES_REPO), "data", "celldega")
+dir.create(annot_dir, recursive = TRUE, showWarnings = FALSE)
+fwrite(annot, file.path(annot_dir, "cell_annotations.csv"))
+
+# 3. Carry over the one palette main.Rmd actually fixes — the per-donor sample colours — so the
+#    Landscape agrees with every TmaPlot already in the manuscript. Cell-type colours were never
+#    pinned there, so those are left to Celldega's own generator rather than invented here.
+base_sample_cols = c(
+  "#E41A1C", "#377EB8", "#4DAF4A", "#FF7F00",
+  "#984EA3", "#A65628", "#F781BF", "#FFED6F",
+  "#00CED1", "#8B0000", "#006400", "#FF6347",
+  "#4B0082", "#2E8B57", "orange"
+)
+SAMPLE_COLORS = list()
+if ("sample_id" %in% ANNOT_COLS) {
+  lv = sort(unique(annot$sample_id))
+  SAMPLE_COLORS = as.list(setNames(
+    grDevices::rgb(t(grDevices::col2rgb(base_sample_cols[seq_along(lv)])), maxColorValue = 255),
+    lv
+  ))
+}
+
+rm(usc2); invisible(gc())
+```
+
+```{python annot_to_clusters}
+
+# 1. Materialise the default annotation as the 10x-style clusters.csv the Xenium path expects.
+#    Cells present in the flat files but absent from the (QC-filtered) Seurat object still have to
+#    appear, or create_cluster_and_meta_cluster() drops them out of the Landscape entirely - they
+#    are labelled "filtered" so their absence from the analysis stays visible on screen.
+import pandas as pd
+
+ANNOT_CSV     = REPO / "data" / "celldega" / "cell_annotations.csv"
+DEFAULT_ANNOT = r.DEFAULT_ANNOT
+ANNOT_COLS    = list(r.ANNOT_COLS)
+
+annot = pd.read_csv(ANNOT_CSV, dtype=str).set_index("cell_id")
+all_cells = pd.read_csv(cells_csv, usecols=["cell_id"], dtype=str)["cell_id"]
+
+clusters_csv = XEN / "analysis" / "clustering" / "gene_expression_graphclust" / "clusters.csv"
+clusters_csv.parent.mkdir(parents=True, exist_ok=True)
+lab = annot[DEFAULT_ANNOT].reindex(all_cells).fillna("filtered")
+pd.DataFrame({"Barcode": all_cells.values, "Cluster": lab.values}).to_csv(clusters_csv, index=False)
+
+n_filtered = int((lab == "filtered").sum())
+print(f"{DEFAULT_ANNOT}: {lab.nunique()} levels over {len(lab):,} cells "
+      f"({n_filtered:,} not in the Seurat object -> 'filtered')")
+print(lab.value_counts().head(15))
+```
+
+## 5. Morphology mosaic → DeepZoom pyramids
+#### =====================================================================================================
+
+Celldega wants one DeepZoom pyramid per displayable channel. There is no stitched image in this
+export — only 182 per-FOV 5-plane TIFFs — so the mosaic is built here, at `DOWNSAMPLE`, straight
+from the §2 placement rule. (The sibling `LiverCosMX/minerva/minerva_make_ometiff.R` also produces a
+stitched OME-TIFF, via terra + bftools; it is not reused because it bakes in its own downsample and
+an inverted-Y world frame, and re-deriving the mapping onto it is strictly more work than laying the
+tiles down here with a rule we have already verified to the pixel.)
+
+Each channel is assembled into a disk-backed `np.memmap` rather than RAM: at `DOWNSAMPLE=4` a
+channel is ~771 MB as uint8, and holding one at a time keeps the peak well under a laptop's memory.
+
+```{python image_pyramids}
+
+# 1. Stitch and pyramidise one channel at a time.
+import pyvips
+
+PYR = DEGA / "pyramid_images"
+PYR.mkdir(parents=True, exist_ok=True)
+SCRATCH = Path(os.environ.get("L_SCRATCH", XEN))       # high-IOPS temp on Sherlock
+
+fov_rows = {int(r_["fov"]): (r_["x_fov"], r_["y_fov"]) for r_ in fov_pos.to_dicts()}
+tif_of   = {int(re.search(r"_F(\d+)\.TIF$", p.name, re.I).group(1)): p
+            for p in MORPH.glob("*.TIF")}
+missing  = sorted(set(fov_rows) - set(tif_of))
+assert not missing, f"no morphology TIFF for FOV(s) {missing}"
+
+for plane, name, _btn, _rgb in CHANNELS:
+    if (PYR / f"{name}.dzi").exists():
+        print(f"{name}: pyramid exists, skipping"); continue
+
+    mm_path = SCRATCH / f"_mosaic_{name}.u8"
+    mosaic  = np.memmap(mm_path, dtype=np.uint8, mode="w+", shape=(MOSAIC_H, MOSAIC_W))
+    t = time.time()
+
+    # 2. Contrast: one global window per channel, from a coarse sample of every 12th FOV, so all
+    #    FOVs share a stretch and tile seams do not turn into brightness steps.
+    samp = np.concatenate([
+        tifffile.imread(tif_of[f])[plane][::16, ::16].ravel()
+        for f in sorted(fov_rows)[::12]
+    ])
+    samp = samp[samp > 0]
+    lo, hi = (np.percentile(samp, (1, 99.5)) if samp.size else (0.0, 1.0))
+    hi = float(max(hi, lo + 1)); lo = float(lo)
+    del samp
+
+    # 3. Lay every FOV down at its mosaic offset. row0 of the (possibly flipped) tile goes to
+    #    Y_MAX - y_fov; see the affine in section 2.
+    for k, fv in enumerate(sorted(fov_rows)):
+        x_fov, y_fov = fov_rows[fv]
+        tile = tifffile.imread(tif_of[fv])[plane]
+        if FLIP_TILE:
+            tile = tile[::-1]
+        tile = tile[::DOWNSAMPLE, ::DOWNSAMPLE].astype(np.float32)
+        np.clip(tile, lo, hi, out=tile)
+        tile = ((tile - lo) * (255.0 / (hi - lo))).astype(np.uint8)
+
+        r0 = int(round((Y_MAX - y_fov) * COORD_SCALE))
+        c0 = int(round((x_fov - X_MIN) * COORD_SCALE))
+        h, w = tile.shape
+        r1, c1 = min(r0 + h, MOSAIC_H), min(c0 + w, MOSAIC_W)
+        # overlapping FOVs: keep the brighter pixel rather than letting the last tile win
+        np.maximum(mosaic[r0:r1, c0:c1], tile[:r1-r0, :c1-c0], out=mosaic[r0:r1, c0:c1])
+        if (k + 1) % 40 == 0:
+            print(f"  {name}: {k+1}/{len(fov_rows)} FOVs  {time.time()-t:.0f}s", flush=True)
+    mosaic.flush()
+
+    # 4. DeepZoom. pyvips reads the memmap without copying it into the Python heap.
+    vi = pyvips.Image.new_from_memory(memoryview(mosaic), MOSAIC_W, MOSAIC_H, 1, "uchar")
+    vi.dzsave(str(PYR / name), tile_size=512, overlap=0, suffix=".webp[Q=90]")
+    del vi, mosaic
+    mm_path.unlink(missing_ok=True)
+    print(f"{name}: {MOSAIC_W}x{MOSAIC_H} pyramid done  ({time.time()-t:.0f}s)", flush=True)
+
+print("max zoom level:", dega.pre.get_max_zoom_level(str(PYR / "dapi_files")))
+```
+
+## 6. Celldega pre-processing → DegaFiles
+#### =====================================================================================================
+
+From here the ordinary Xenium pipeline runs untouched, with `technology="Xenium"`. Order matters:
+`make_meta_gene()` writes the gene→int name mapping that the transcript tiler then looks up, and
+`save_landscape_parameters()` has to come last because it inspects everything already on disk.
+
+```{python dega_transform_cells}
+
+# 1. The affine from section 2, in celldega's space-separated 3x3 format.
+tpath = DEGA / "micron_to_image_transform.csv"
+pd.DataFrame(AFFINE).to_csv(tpath, sep=" ", header=False, index=False)
+
+# 2. Cell centroids -> image px. image_scale stays 1: the scale already lives in the affine, and
+#    celldega applies image_scale inconsistently between functions, so keeping it out of play means
+#    cells, transcripts and boundaries cannot drift apart.
+dega.pre.make_meta_cell_image_coord(
+  "Xenium",
+  str(tpath),
+  str(cells_csv),
+  str(DEGA / "cell_metadata.parquet"),
+  image_scale = 1
+)
+
+cm = pd.read_parquet(DEGA / "cell_metadata.parquet")
+xy = np.array(cm["geometry"].to_list())
+print(f"{len(cm):,} cells   x {xy[:,0].min():.0f}-{xy[:,0].max():.0f}   "
+      f"y {xy[:,1].min():.0f}-{xy[:,1].max():.0f}   (mosaic {MOSAIC_W} x {MOSAIC_H})")
+assert xy.min() > -TILE_SIZE and xy[:,0].max() < MOSAIC_W + TILE_SIZE \
+       and xy[:,1].max() < MOSAIC_H + TILE_SIZE, "cells fall outside the mosaic - affine is wrong"
+```
+
+```{python dega_cbg}
+
+# 1. Read the CBG back, cached as h5ad: the MTX is ~126M nonzeros and slow to re-parse from text.
+import anndata as ad
+
+h5 = XEN / "cbg.h5ad"
+if h5.exists():
+    adata = ad.read_h5ad(h5)
+else:
+    cbg0  = dega.pre.read_cbg_mtx(str(CBG_DIR), technology="Xenium")
+    adata = ad.AnnData(
+        sp.csr_matrix(cbg0.sparse.to_coo()).astype(np.float32),
+        obs = pd.DataFrame(index=pd.Index(np.asarray(cbg0.index,   dtype=str))),
+        var = pd.DataFrame(index=pd.Index(np.asarray(cbg0.columns, dtype=str))),
+    )
+    adata.obs.index.name = None; adata.var.index.name = None
+    adata.write_h5ad(h5); del cbg0
+
+cbg = pd.DataFrame.sparse.from_spmatrix(adata.X, index=adata.obs_names, columns=adata.var_names)
+assert str(cbg.index[0]).startswith("c_"), "barcodes are not CosMx cell_ids"
+print("cbg", cbg.shape)
+
+# 2. Gene metadata, per-cluster signature matrix, per-gene parquets, cluster colours.
+dega.pre.make_meta_gene(cbg, str(DEGA / "meta_gene.parquet"))
+dega.pre.cluster_gene_expression("Xenium", str(DEGA), cbg, str(XEN))
+dega.pre.save_cbg_gene_parquets("Xenium", str(DEGA), cbg, verbose=False)
+dega.pre.create_cluster_and_meta_cluster("Xenium", str(DEGA), str(XEN))
+
+del cbg, adata
+import gc; gc.collect()
+```
+
+`make_trx_tiles()` loads the whole transcript parquet before tiling, which at CosMx transcript
+counts (the tx file alone is 2.6 GB *gzipped*) is an OOM on anything but a `bigmem` node. Celldega's
+own CosMx notebook hits the same wall and replaces the call with a streaming tiler; the same is done
+here, producing the identical
+`transcript_tiles/transcripts_tile_<x>_<y>.parquet` layout (`name` = the int gene id from the §6
+mapping, `geometry` = `[x, y]` in mosaic px). Nothing is subsampled.
+
+```{python dega_trx_tiles}
+
+# 1. Gene name -> int, as written by make_meta_gene(). Anything the tiler cannot resolve would be
+#    silently dropped, so unresolved targets are counted and reported instead.
+from celldega.pre.boundary_tile import _get_name_mapping
+
+gene_to_int = _get_name_mapping(str(DEGA), layer="transcript")
+
+out = DEGA / "transcript_tiles"
+if not out.exists():
+    spill = Path(os.environ.get("L_SCRATCH", XEN)) / "_trx_spill"
+    if spill.exists():
+        shutil.rmtree(spill)
+    spill.mkdir(parents=True)
+
+    n_tiles_x = int(np.ceil(MOSAIC_W / TILE_SIZE)) + 1
+    n_tiles_y = int(np.ceil(MOSAIC_H / TILE_SIZE)) + 1
+    seen, dropped, kept, t = set(), 0, 0, time.time()
+
+    for bi, batch in enumerate(pq.ParquetFile(str(trx_pq)).iter_batches(
+            batch_size=8_000_000, columns=["feature_name", "x_location", "y_location"])):
+        df  = pl.from_arrow(batch)
+        uni = df["feature_name"].unique().to_list()
+        dropped += int(df.filter(~pl.col("feature_name").is_in(list(gene_to_int))).height)
+        df = (df.with_columns(
+                  pl.col("feature_name")
+                    .replace_strict({g: gene_to_int.get(g) for g in uni},
+                                    default=None, return_dtype=pl.Int64).alias("name"))
+                .drop_nulls("name"))
+
+        # same affine as the cells: x' = (x - X_MIN)*s ,  y' = (Y_MAX - y)*s
+        df = df.with_columns(
+                 ((pl.col("x_location") - X_MIN) * COORD_SCALE).round(2).alias("gx"),
+                 ((Y_MAX - pl.col("y_location")) * COORD_SCALE).round(2).alias("gy"))
+        df = df.with_columns(
+                 (pl.col("gx") / TILE_SIZE).floor().cast(pl.Int32).clip(0, n_tiles_x - 1).alias("tx"),
+                 (pl.col("gy") / TILE_SIZE).floor().cast(pl.Int32).clip(0, n_tiles_y - 1).alias("ty")
+             ).with_columns(pl.concat_list(["gx", "gy"]).alias("geometry"))
+
+        for (tx, ty), td in df.partition_by(["tx", "ty"], as_dict=True).items():
+            d = spill / f"{tx}_{ty}"; d.mkdir(exist_ok=True)
+            td.select(["name", "geometry"]).write_parquet(d / f"part_{bi:04d}.parquet")
+            seen.add((tx, ty))
+        kept += df.height
+        if bi % 5 == 0:
+            print(f"  {kept:,} transcripts, {len(seen)} tiles, {time.time()-t:.0f}s", flush=True)
+
+    # 2. Coalesce the per-batch spill into one parquet per tile.
+    out.mkdir()
+    for tx, ty in sorted(seen):
+        parts = sorted((spill / f"{tx}_{ty}").glob("part_*.parquet"))
+        (pl.concat([pl.read_parquet(p) for p in parts]).to_pandas()
+           .to_parquet(out / f"transcripts_tile_{tx}_{ty}.parquet", index=False))
+    shutil.rmtree(spill)
+    print(f"{kept:,} transcripts in {len(seen)} tiles; {dropped:,} unresolved targets "
+          f"({time.time()-t:.0f}s)")
+    # Reported rather than asserted: this fires after ~an hour of tiling, and a handful of
+    # unresolved targets is survivable. On TA649 it is 0 - exprMat and tx use the same gene
+    # spelling (both hyphenated, e.g. HLA-DRA), so the '-' vs '_' reconciliation the Celldega
+    # CosMx notebook needs for its WTx sample is not required here.
+    if dropped:
+        print(f"  WARNING: {dropped:,} transcripts dropped - their target is absent from the "
+              f"expression matrix. Check gene-name spelling before trusting transcript density.")
+else:
+    print("transcript_tiles/ exists, skipping")
+```
+
+```{python dega_cell_tiles}
+
+# 1. Boundary tiles. tile_bounds must be the mosaic, not the data extent, or the tile grid drifts
+#    out of step with the transcript grid above.
+tile_bounds = {"x_min": 0.0, "y_min": 0.0, "x_max": float(MOSAIC_W), "y_max": float(MOSAIC_H)}
+
+if not (DEGA / "cell_segmentation").exists():
+    dega.pre.make_cell_boundary_tiles(
+      "Xenium",
+      str(bounds_pq),
+      str(DEGA / "cell_segmentation"),
+      str(cells_csv),
+      str(tpath),
+      coarse_tile_factor = 10,
+      tile_size          = TILE_SIZE,
+      tile_bounds        = tile_bounds,
+      image_scale        = 1,
+      max_workers        = MAX_WORKERS
+    )
+else:
+    print("cell_segmentation/ exists, skipping")
+```
+
+```{python dega_params}
+
+# 1. landscape_parameters.json - written last, it reads the state of everything above.
+dega.pre.save_landscape_parameters(
+  "Xenium",
+  str(DEGA),
+  image_name     = "dapi_files",
+  tile_size      = TILE_SIZE,
+  image_info     = IMAGE_INFO,
+  image_format   = ".webp",
+  use_int_index  = True,
+  use_row_groups = False
+)
+
+for p in sorted(DEGA.iterdir()):
+    n = len(list(p.iterdir())) if p.is_dir() else ""
+    print(f"  {p.name:<32} {'dir, ' + str(n) + ' entries' if p.is_dir() else str(p.stat().st_size // 1024) + ' KB'}")
+```
+
+## 7. Switchable annotations (cell type, donor, TMA core, FOV)
+#### =====================================================================================================
+
+Two mechanisms exist for colouring cells, and they are not interchangeable:
+
+- **File-based.** `cell_clusters/` in the DegaFiles is the default colouring — that is what §4/§6
+  already wrote from `celltype_despotx`. `add_clustering_from_adata(segmentation_name=...)` writes
+  extra `cell_clusters_<name>/` directories, but selecting one means setting the widget's
+  `segmentation` trait, which *also* redirects it to `meta_gene_<name>.parquet` and
+  `cell_segmentation_<name>/`. Those do not exist, so that route 404s unless a whole parallel
+  segmentation is duplicated. It is the wrong tool for "recolour by donor".
+- **AnnData-based.** `Landscape(adata=...)` takes an AnnData used *only* for cell metadata (never
+  expression), keyed on `obs_names` against `cell_metadata.parquet`. `cell_attr` lists the `obs`
+  columns to expose and `cluster_attr` picks the active one, switchable from the widget UI.
+
+So the annotation AnnData below is the switchable route, and it is also written to disk so the view
+can be reopened without re-running §4.
+
+```{python annot_adata}
+
+# 1. An obs-only AnnData: X is a 1-column zero matrix because Landscape never reads it.
+obs = annot.reindex(all_cells).fillna("filtered")
+obs.index = all_cells.values
+obs.index.name = None
+for key in ANNOT_COLS:
+    obs[key] = obs[key].astype("category")
+
+ad_annot = ad.AnnData(sp.csr_matrix((len(obs), 1), dtype=np.float32), obs=obs)
+
+# 2. Reuse the donor palette from main.Rmd so the Landscape matches the published TmaPlots.
+#    Cell-type colours were never pinned there, so Celldega's deterministic HSV generator supplies
+#    those rather than this document inventing a second, conflicting scheme.
+# reticulate hands back either a scalar or a length-1 list depending on conversion settings
+sample_colors = {k: (v[0] if isinstance(v, (list, tuple)) else v)
+                 for k, v in dict(r.SAMPLE_COLORS).items()}
+if sample_colors and "sample_id" in ad_annot.obs:
+    cats = list(ad_annot.obs["sample_id"].cat.categories)
+    ad_annot.uns["sample_id_colors"] = [sample_colors.get(c, "#B0B0B0") for c in cats]
+
+ANNOT_H5AD = DEGA / "cell_annotations.h5ad"
+ad_annot.write_h5ad(ANNOT_H5AD)
+for key in ANNOT_COLS:
+    print(f"  {key:<20} {ad_annot.obs[key].nunique():>4} levels")
+
+# 3. Also refresh the on-disk default clustering, so a statically hosted copy of the DegaFiles
+#    (section 10) still opens coloured by cell type with no AnnData in hand.
+dega.pre.add_clustering_from_adata(ad_annot, str(DEGA), cluster_key=DEFAULT_ANNOT)
+```
+
+## 8. Interactive Landscape
+#### =====================================================================================================
+
+The widget reads DegaFiles over HTTP, so they have to be served rather than opened from a path.
+`get_local_server()` starts a CORS-enabled thread server **rooted at the current working
+directory** and returns its port — so `base_url` is that port plus the path to `DEGA` *relative to
+cwd*. For a shared or permanent view, sync `DEGA` to a bucket or GitHub repo and point `base_url` at
+the raw URL instead (§10); that is how the Celldega gallery datasets are hosted.
+
+This is an anywidget: it renders in Jupyter, VS Code or a browser, but **will not appear in static
+knitted HTML** from RStudio. Run this chunk interactively.
+
+```{python landscape_view}
+
+# 1. Serve the DegaFiles. The server is rooted at cwd, hence the relative path.
+port     = dega.viz.get_local_server()
+rel_dega = os.path.relpath(DEGA, Path.cwd())
+base_url = f"http://localhost:{port}/{rel_dega}"
+print("serving DegaFiles at", base_url)
+
+# 2. Open the Landscape. scale_bar_microns_per_pixel keeps the on-screen bar honest: the mosaic is
+#    DOWNSAMPLE x coarser than the 0.1203 um instrument pixel.
+landscape = dega.viz.Landscape(
+  technology   = "Xenium",
+  base_url     = base_url,
+  adata        = ad_annot,
+  cell_attr    = ANNOT_COLS,
+  cluster_attr = DEFAULT_ANNOT,
+  height       = 800,
+  scale_bar_microns_per_pixel = PX_UM * DOWNSAMPLE,
+)
+landscape
+```
+
+```{python landscape_zoom, eval=FALSE}
+
+# 1. Jump straight to one TMA core rather than hunting for it. ini_x / ini_y are mosaic px, so any
+#    cell's position out of cell_metadata.parquet is a valid target.
+if "core_str" in annot.columns:
+    core   = annot.index[annot["core_str"] == "C3R3"]
+    sel    = cm[cm["name"].isin(core)]
+    cx, cy = np.array(sel["geometry"].to_list()).mean(axis=0)
+    landscape.ini_x, landscape.ini_y, landscape.ini_z = float(cx), float(cy), 3.0
+    print(f"centred on core C3R3 ({len(sel):,} cells) at ({cx:.0f}, {cy:.0f})")
+```
+
+## 9. Landscape + Clustergram
+#### =====================================================================================================
+
+`cluster_gene_expression()` in §6 wrote `df_sig.parquet`, the mean expression of every gene in every
+level of the default annotation. Rendered as a Clustergram beside the Landscape, clicking a gene row
+recolours the tissue by that gene — the marker-checking loop from `main.Rmd`'s dot plots, but on
+tissue instead of a UMAP.
+
+```{python clustergram}
+
+# 1. Cluster the signature matrix: column-total normalisation then row z-score, so the map shows
+#    enrichment relative to the other cell types rather than absolute abundance.
+df_sig = pd.read_parquet(DEGA / "df_sig.parquet")
+mat = dega.clust.Matrix(df_sig)
+mat.norm(axis="col", by="total")
+mat.norm(axis="row", by="zscore")
+mat.cluster()
+
+cgm = dega.viz.Clustergram(matrix=mat, width=600, height=700)
+
+# 2. spatial_clustergram() is the current API; landscape_clustergram() is a deprecated alias.
+dega.viz.spatial_clustergram(landscape, cgm)
+```
+## 10. Publishing
+#### =====================================================================================================
+
+DegaFiles are static — no server-side code — so a plain object store or a GitHub repo is enough to
+share the view. Per `CLAUDE.md`, `$SCRATCH` is purged after 90 days without a write, so the
+DegaFiles directory is a build artefact, not the archive: Box (`CosMX AIH/TA649/`) or `$OAK` holds
+the source data.
+
+```{bash publish, eval=FALSE}
+# 1. Many small tiles - sync, do not tar-and-copy.
+ml load system rclone
+rclone sync data/celldega/TA649_dega box:"CosMX AIH/TA649/celldega_dega" --transfers 32 --checkers 32
+
+# 2. Then point base_url at the served location:
+#    landscape = dega.viz.Landscape(technology='Xenium', base_url='https://.../TA649_dega')
+```
+
+```{r session_info}
+sessionInfo()
+reticulate::py_config()
+```
